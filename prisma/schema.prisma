@@ -1,0 +1,240 @@
+// Prisma schema for Rally.
+// Mirrors the ERD in docs/02-architecture.md. Checklists and custom fields
+// are documented as Phase 1 features but not modeled yet, add them when
+// that feature is actually built.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// --- Auth.js (NextAuth) required models ---
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// --- Core domain ---
+
+enum Role {
+  OWNER
+  ADMIN
+  MEMBER
+  GUEST
+}
+
+enum TaskStatus {
+  TODO
+  IN_PROGRESS
+  IN_REVIEW
+  DONE
+}
+
+enum TaskPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String    @unique
+  emailVerified DateTime?
+  image         String?
+  passwordHash  String?
+  createdAt     DateTime  @default(now())
+
+  accounts    Account[]
+  sessions    Session[]
+  memberships UserMembership[]
+  guestShares GuestShare[]
+
+  assignedTasks Task[]    @relation("TaskAssignees")
+  createdTasks  Task[]    @relation("TaskCreator")
+  comments      Comment[]
+  messages      Message[]
+  channels      Channel[] @relation("ChannelMembers")
+}
+
+model Workspace {
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique
+  createdAt DateTime @default(now())
+
+  memberships UserMembership[]
+  spaces      Space[]
+  channels    Channel[]
+  guestShares GuestShare[]
+}
+
+model UserMembership {
+  id          String   @id @default(cuid())
+  role        Role
+  createdAt   DateTime @default(now())
+  userId      String
+  workspaceId String
+
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, workspaceId])
+}
+
+model Space {
+  id          String   @id @default(cuid())
+  name        String
+  createdAt   DateTime @default(now())
+  workspaceId String
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  lists     List[]
+}
+
+model List {
+  id          String    @id @default(cuid())
+  name        String
+  isSprint    Boolean   @default(false)
+  sprintStart DateTime?
+  sprintEnd   DateTime?
+  createdAt   DateTime  @default(now())
+  spaceId     String
+
+  space       Space        @relation(fields: [spaceId], references: [id], onDelete: Cascade)
+  tasks       Task[]
+  guestShares GuestShare[]
+}
+
+model Task {
+  id          String       @id @default(cuid())
+  title       String
+  description String?
+  status      TaskStatus   @default(TODO)
+  priority    TaskPriority @default(MEDIUM)
+  dueDate     DateTime?
+  position    Int          @default(0)
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  listId      String
+  createdById String
+  parentId    String?
+
+  list      List   @relation(fields: [listId], references: [id], onDelete: Cascade)
+  createdBy User   @relation("TaskCreator", fields: [createdById], references: [id])
+  parent    Task?  @relation("Subtasks", fields: [parentId], references: [id], onDelete: Cascade)
+  subtasks  Task[] @relation("Subtasks")
+
+  assignees   User[]       @relation("TaskAssignees")
+  dependsOn   Task[]       @relation("TaskDependencies")
+  blocks      Task[]       @relation("TaskDependencies")
+  comments    Comment[]
+  attachments Attachment[]
+  messages    Message[]
+}
+
+model Comment {
+  id        String   @id @default(cuid())
+  body      String
+  createdAt DateTime @default(now())
+  taskId    String
+  authorId  String
+
+  task   Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  author User @relation(fields: [authorId], references: [id])
+}
+
+model Attachment {
+  id        String   @id @default(cuid())
+  url       String
+  filename  String
+  createdAt DateTime @default(now())
+  taskId    String
+
+  task Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+}
+
+// --- Chat ---
+
+model Channel {
+  id          String   @id @default(cuid())
+  name        String?
+  isDirect    Boolean  @default(false)
+  createdAt   DateTime @default(now())
+  workspaceId String
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  members   User[]    @relation("ChannelMembers")
+  messages  Message[]
+}
+
+model Message {
+  id              String   @id @default(cuid())
+  body            String
+  createdAt       DateTime @default(now())
+  channelId       String
+  authorId        String
+  parentMessageId String?
+  taskId          String?
+
+  channel       Channel   @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  author        User      @relation(fields: [authorId], references: [id])
+  parentMessage Message?  @relation("MessageReplies", fields: [parentMessageId], references: [id], onDelete: NoAction, onUpdate: NoAction)
+  replies       Message[] @relation("MessageReplies")
+  task          Task?     @relation(fields: [taskId], references: [id])
+}
+
+// --- Guest access ---
+// A guest's UserMembership has role GUEST. GuestShare scopes exactly which
+// lists that guest can see, everything else in the workspace stays hidden.
+
+model GuestShare {
+  id          String   @id @default(cuid())
+  createdAt   DateTime @default(now())
+  workspaceId String
+  userId      String
+  listId      String
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  list      List      @relation(fields: [listId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, listId])
+}
