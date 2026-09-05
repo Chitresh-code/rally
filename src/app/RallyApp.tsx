@@ -1,14 +1,35 @@
 "use client";
 
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useState, type ChangeEvent, type CSSProperties, type ReactNode } from "react";
 import { signOut } from "next-auth/react";
-import { createTask, deleteTask, postComment, updateTaskAssignee, updateTaskDescription, updateTaskDueDate, updateTaskPriority, updateTaskStatus } from "./actions";
+import {
+  assignToSpace,
+  createInvite,
+  createList,
+  createSpace,
+  createTask,
+  deleteTask,
+  markAllNotificationsRead,
+  markNotificationRead,
+  postComment,
+  postMessage,
+  removeFromSpace,
+  revokeInvite,
+  setMemberRole,
+  updateTaskAssignee,
+  updateTaskDescription,
+  updateTaskDueDate,
+  updateTaskPriority,
+  updateTaskStatus,
+} from "./actions";
+import { activeMentionQuery, mentionToken, parseMentions } from "@/lib/mentions";
 
 /* ---------- types (shaped server-side from real Prisma data) ---------- */
 
 export type UiAvatar = { id: string; name: string; initials: string; hue: number };
 export type PriorityKey = "urgent" | "high" | "normal" | "low";
 export type StatusKey = "todo" | "in_progress" | "review" | "done";
+export type RoleKey = "OWNER" | "ADMIN" | "MEMBER" | "GUEST";
 
 export type UiTask = {
   id: string;
@@ -23,16 +44,26 @@ export type UiTask = {
   comments: number;
 };
 
-export type UiList = { id: string; name: string; isSprint: boolean; tasks: UiTask[] };
-export type UiSpace = { id: string; name: string; hue: number; lists: UiList[] };
+export type UiList = { id: string; name: string; isSprint: boolean; sprintStart: string | null; sprintEnd: string | null; tasks: UiTask[] };
+export type UiSpace = { id: string; name: string; hue: number; members: UiAvatar[]; lists: UiList[] };
+export type UiMessage = { id: string; author: UiAvatar; text: string; time: string };
+export type UiChannel = { id: string; name: string; members: UiAvatar[]; messages: UiMessage[] };
+export type UiInvite = { id: string; email: string; role: string; scope: string | null; url: string };
+export type UiMember = UiAvatar & { role: RoleKey };
+export type UiNotification = { id: string; text: string; time: string; read: boolean; taskId: string | null };
 
 export type RallyAppProps = {
   workspaceName: string;
   currentUser: UiAvatar;
   isGuestRole: boolean;
+  role: RoleKey;
   spaces: UiSpace[];
   sharedLists: UiList[];
   members: UiAvatar[];
+  allMembers: UiMember[];
+  channels: UiChannel[];
+  pendingInvites: UiInvite[];
+  notifications: UiNotification[];
 };
 
 const STATUSES: { key: StatusKey; label: string; color: string }[] = [
@@ -92,6 +123,103 @@ function Pill({ bg, fg, children }: { bg: string; fg: string; children: ReactNod
 
 function Skel({ w, h, r = 6 }: { w: string | number; h: number; r?: number }) {
   return <div className="rl-skel" style={{ width: w, height: h, borderRadius: r, flex: "none" }} />;
+}
+
+/** Renders `@[Name](id)` mention tokens as just the name, no "@", highlighted. */
+function renderMentionNodes(text: string): ReactNode {
+  return parseMentions(text).map((seg, i) =>
+    seg.type === "mention" ? (
+      <span key={i} style={{ fontWeight: 700, color: "oklch(0.68 0.16 35)" }}>
+        {seg.name}
+      </span>
+    ) : (
+      <span key={i}>{seg.value}</span>
+    )
+  );
+}
+
+/** A text input with "@" autocomplete that inserts a `@[Name](id)` mention token. */
+function MentionComposer({
+  value,
+  onChange,
+  candidates,
+  placeholder,
+  disabled,
+  onEnter,
+  inputStyle,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  candidates: UiAvatar[];
+  placeholder: string;
+  disabled?: boolean;
+  onEnter: () => void;
+  inputStyle: CSSProperties;
+}) {
+  const [mention, setMention] = useState<{ start: number; query: string } | null>(null);
+
+  function handleChange(e: ChangeEvent<HTMLInputElement>) {
+    const v = e.target.value;
+    onChange(v);
+    setMention(activeMentionQuery(v, e.target.selectionStart ?? v.length));
+  }
+
+  function pick(m: UiAvatar) {
+    if (!mention) return;
+    const before = value.slice(0, mention.start);
+    const after = value.slice(mention.start + 1 + mention.query.length);
+    onChange(`${before}${mentionToken(m.name, m.id)} ${after}`);
+    setMention(null);
+  }
+
+  const matches = mention ? candidates.filter((c) => c.name.toLowerCase().includes(mention.query.toLowerCase())).slice(0, 6) : [];
+
+  return (
+    <div style={{ position: "relative", flex: 1 }}>
+      <input
+        value={value}
+        onChange={handleChange}
+        onKeyDown={(e) => {
+          if (e.key === "Escape") setMention(null);
+          else if (e.key === "Enter" && !mention) onEnter();
+        }}
+        onBlur={() => setTimeout(() => setMention(null), 120)}
+        placeholder={placeholder}
+        disabled={disabled}
+        style={inputStyle}
+      />
+      {mention && matches.length > 0 && (
+        <div
+          style={{
+            position: "absolute",
+            bottom: "calc(100% + 4px)",
+            left: 0,
+            background: "#fff",
+            border: "1px solid oklch(0.88 0.006 60)",
+            borderRadius: 8,
+            boxShadow: "0 4px 16px rgba(0,0,0,0.1)",
+            overflow: "hidden",
+            zIndex: 20,
+            minWidth: 180,
+          }}
+        >
+          {matches.map((m) => (
+            <div
+              key={m.id}
+              onMouseDown={(e) => {
+                e.preventDefault();
+                pick(m);
+              }}
+              style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px 10px", cursor: "pointer", fontSize: 13 }}
+            >
+              <AvatarCircle a={m} size={20} fontSize={9} />
+              {m.name}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
 }
 
 /** Shows `loading` for `ms` after `key` changes — stands in for a real fetch's pending state. */
@@ -217,60 +345,47 @@ function AppSkeleton() {
   );
 }
 
-/* ---------- mock chat/notifications (not wired to real data yet — Phase 1 roadmap items) ---------- */
-
-const CHANNELS = [
-  { key: "general", name: "general", unread: 2 },
-  { key: "product", name: "product", unread: 0 },
-  { key: "client-work", name: "client-work", unread: 0 },
-];
-const DMS = [{ key: "priya", name: "Priya Shah", unread: 1 }];
-
-type Message = { author: UiAvatar; text: string; time: string };
-const MOCK_JT: UiAvatar = { id: "mock-jt", name: "Jordan Tran", initials: "JT", hue: 240 };
-const MOCK_MK: UiAvatar = { id: "mock-mk", name: "Mina Kwon", initials: "MK", hue: 150 };
-const MOCK_PS: UiAvatar = { id: "mock-ps", name: "Priya Shah", initials: "PS", hue: 340 };
-const MESSAGES: Record<string, Message[]> = {
-  general: [
-    { author: MOCK_JT, text: "Morning! Deploy for the guest share links feature is queued for this afternoon.", time: "9:02 AM" },
-    { author: MOCK_MK, text: "Nice, I'll watch the CI run.", time: "9:15 AM" },
-    { author: MOCK_PS, text: "Client asked if we can push the homepage redesign review to Friday.", time: "9:40 AM" },
-    { author: MOCK_JT, text: "Works for me.", time: "9:41 AM" },
-  ],
-  product: [{ author: MOCK_MK, text: "CI pipeline PR is up for review.", time: "8:50 AM" }],
-  "client-work": [{ author: MOCK_PS, text: "Shared the updated pricing sheet in the client drive.", time: "Yesterday" }],
-  priya: [{ author: MOCK_PS, text: "Can you take a look at the QA notes when you get a sec?", time: "Yesterday" }],
-};
-
-const NOTIFICATIONS = [
-  { id: 1, text: "Mina Kwon assigned you to 'Fix mobile nav overlap'", time: "2h ago", read: false },
-  { id: 2, text: "Priya Shah mentioned you in #general", time: "3h ago", read: false },
-  { id: 3, text: "'Fix login bug' is due tomorrow", time: "5h ago", read: true },
-  { id: 4, text: "Jordan Tran replied to your comment on 'Design task detail modal'", time: "1d ago", read: true },
-];
-
 /* ---------- app ---------- */
 
-export default function RallyApp({ workspaceName, currentUser, isGuestRole, spaces, sharedLists, members }: RallyAppProps) {
+export default function RallyApp({ workspaceName, currentUser, isGuestRole, role, spaces, sharedLists, members, allMembers, channels, pendingInvites, notifications }: RallyAppProps) {
   const bootLoading = useDelayedLoading("boot", 500);
 
   const [activeSpaceId, setActiveSpaceId] = useState<string>(spaces[0]?.id ?? "");
-  const [activeContext, setActiveContext] = useState<"tasks" | "chat" | "notifications">("tasks");
+  const [activeContext, setActiveContext] = useState<"tasks" | "chat" | "notifications" | "manage">("tasks");
   const [activeView, setActiveView] = useState<"board" | "list" | "sprint">("board");
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
-  const [previewGuest, setPreviewGuest] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [mobileChatShowList, setMobileChatShowList] = useState(true);
-  const [activeChannel, setActiveChannel] = useState("general");
+  const [activeChannel, setActiveChannel] = useState(channels[0]?.id ?? "");
   const [newTaskTitle, setNewTaskTitle] = useState("");
   const [addingTask, setAddingTask] = useState(false);
   const [commentBody, setCommentBody] = useState("");
   const [postingComment, setPostingComment] = useState(false);
+  const [messageBody, setMessageBody] = useState("");
+  const [postingMessage, setPostingMessage] = useState(false);
   const [savingField, setSavingField] = useState<"status" | "priority" | "due" | "desc" | "assignee" | null>(null);
   const [draggedTaskId, setDraggedTaskId] = useState<string | null>(null);
   const [dragOverStatus, setDragOverStatus] = useState<StatusKey | null>(null);
+  const [newSpaceName, setNewSpaceName] = useState("");
+  const [creatingSpace, setCreatingSpace] = useState(false);
+  const [inviteEmail, setInviteEmail] = useState("");
+  const [inviteRole, setInviteRole] = useState<"ADMIN" | "MEMBER" | "GUEST">("MEMBER");
+  const [inviteSpaceId, setInviteSpaceId] = useState("");
+  const [inviteListId, setInviteListId] = useState("");
+  const [creatingInvite, setCreatingInvite] = useState(false);
+  const [inviteLink, setInviteLink] = useState<string | null>(null);
+  const [addMemberSelection, setAddMemberSelection] = useState<Record<string, string>>({});
+  const [showListForm, setShowListForm] = useState(false);
+  const [newListName, setNewListName] = useState("");
+  const [newListIsSprint, setNewListIsSprint] = useState(false);
+  const [newListStart, setNewListStart] = useState("");
+  const [newListEnd, setNewListEnd] = useState("");
+  const [creatingList, setCreatingList] = useState(false);
+  const [selectedSprintId, setSelectedSprintId] = useState<string>("");
+  const [savingRole, setSavingRole] = useState<string | null>(null);
 
-  const isGuest = isGuestRole || previewGuest;
+  const isGuest = isGuestRole;
+  const canManage = !isGuest && (role === "OWNER" || role === "ADMIN");
 
   const selectSpace = (id: string) => {
     setActiveSpaceId(id);
@@ -287,17 +402,10 @@ export default function RallyApp({ workspaceName, currentUser, isGuestRole, spac
     setCommentBody("");
   };
   const closeTask = () => setSelectedTaskId(null);
-  const toggleGuest = () => {
-    setPreviewGuest((g) => {
-      const next = !g;
-      setActiveContext("tasks");
-      setDrawerOpen(false);
-      return next;
-    });
-  };
   const toggleDrawer = () => setDrawerOpen((d) => !d);
   const selectChannel = (key: string) => {
     setActiveChannel(key);
+    setMessageBody("");
     setMobileChatShowList(false);
   };
   const backToChatList = () => setMobileChatShowList(true);
@@ -305,13 +413,15 @@ export default function RallyApp({ workspaceName, currentUser, isGuestRole, spac
   const showTasks = isGuest || activeContext === "tasks";
   const showChat = !isGuest && activeContext === "chat";
   const showNotifications = !isGuest && activeContext === "notifications";
+  const showManage = canManage && activeContext === "manage";
 
   const activeSpace = spaces.find((s) => s.id === activeSpaceId) ?? spaces[0];
-  const guestLists = isGuestRole ? sharedLists : previewGuest ? spaces[0]?.lists.slice(0, 1) ?? [] : [];
+  const spaceMembers = activeSpace?.members ?? members;
+  const allLists = spaces.flatMap((s) => s.lists.map((l) => ({ id: l.id, label: `${s.name} / ${l.name}` })));
+  const guestLists = isGuestRole ? sharedLists : [];
   const tasksInSpace = isGuest ? guestLists.flatMap((l) => l.tasks) : activeSpace?.lists.flatMap((l) => l.tasks) ?? [];
-  const sprintListName = isGuest
-    ? guestLists[0]?.name ?? "Shared list"
-    : activeSpace?.lists.find((l) => l.isSprint)?.name ?? activeSpace?.lists[0]?.name ?? activeSpace?.name ?? "";
+  const sprintLists = isGuest ? [] : activeSpace?.lists.filter((l) => l.isSprint) ?? [];
+  const sprintList = isGuest ? guestLists[0] : sprintLists.find((l) => l.id === selectedSprintId) ?? sprintLists[0];
   const targetList = isGuest ? guestLists[0] : activeSpace?.lists.find((l) => l.isSprint) ?? activeSpace?.lists[0];
 
   async function handleCreateTask() {
@@ -399,6 +509,86 @@ export default function RallyApp({ workspaceName, currentUser, isGuestRole, spac
     }
   }
 
+  async function handleSendMessage() {
+    const body = messageBody.trim();
+    if (!body || !activeChannel || postingMessage) return;
+    setPostingMessage(true);
+    try {
+      await postMessage(activeChannel, body);
+      setMessageBody("");
+    } finally {
+      setPostingMessage(false);
+    }
+  }
+
+  async function handleCreateSpace() {
+    const name = newSpaceName.trim();
+    if (!name || creatingSpace) return;
+    setCreatingSpace(true);
+    try {
+      await createSpace(name);
+      setNewSpaceName("");
+    } finally {
+      setCreatingSpace(false);
+    }
+  }
+
+  async function handleCreateInvite() {
+    const email = inviteEmail.trim();
+    if (!email || creatingInvite) return;
+    if (inviteRole === "MEMBER" && !inviteSpaceId) return;
+    if (inviteRole === "GUEST" && !inviteListId) return;
+    setCreatingInvite(true);
+    try {
+      const result = await createInvite({
+        email,
+        role: inviteRole,
+        spaceId: inviteRole !== "GUEST" ? inviteSpaceId || undefined : undefined,
+        listId: inviteRole === "GUEST" ? inviteListId : undefined,
+      });
+      setInviteLink(result?.url ?? null);
+      setInviteEmail("");
+    } finally {
+      setCreatingInvite(false);
+    }
+  }
+
+  async function handleAddMember(spaceId: string) {
+    const userId = addMemberSelection[spaceId];
+    if (!userId) return;
+    await assignToSpace(spaceId, userId);
+    setAddMemberSelection((s) => ({ ...s, [spaceId]: "" }));
+  }
+
+  async function handleCreateList() {
+    const name = newListName.trim();
+    if (!name || !activeSpace || creatingList) return;
+    setCreatingList(true);
+    try {
+      await createList(activeSpace.id, name, newListIsSprint, newListStart || undefined, newListEnd || undefined);
+      setNewListName("");
+      setNewListIsSprint(false);
+      setNewListStart("");
+      setNewListEnd("");
+      setShowListForm(false);
+    } finally {
+      setCreatingList(false);
+    }
+  }
+
+  async function handleOpenNotification(n: UiNotification) {
+    if (!n.read) await markNotificationRead(n.id);
+  }
+
+  async function handleSetMemberRole(userId: string, role: "ADMIN" | "MEMBER") {
+    setSavingRole(userId);
+    try {
+      await setMemberRole(userId, role);
+    } finally {
+      setSavingRole(null);
+    }
+  }
+
   const tasksLoading = useDelayedLoading(`${activeSpaceId}:${activeView}:${isGuest}`, 350);
   const chatLoading = useDelayedLoading(activeChannel, 300);
   const notifLoading = useDelayedLoading(`notif:${showNotifications}`, 300);
@@ -410,12 +600,13 @@ export default function RallyApp({ workspaceName, currentUser, isGuestRole, spac
     tasks: tasksInSpace.filter((t) => t.status === st.key),
   }));
 
-  const doneCount = tasksInSpace.filter((t) => t.status === "done").length;
+  const sprintTasks = sprintList?.tasks ?? [];
+  const sprintDone = sprintTasks.filter((t) => t.status === "done").length;
   const sprintInfo = {
-    name: sprintListName,
-    done: doneCount,
-    total: tasksInSpace.length,
-    pct: tasksInSpace.length ? Math.round((doneCount / tasksInSpace.length) * 100) : 0,
+    name: sprintList?.name ?? "No sprint yet",
+    done: sprintDone,
+    total: sprintTasks.length,
+    pct: sprintTasks.length ? Math.round((sprintDone / sprintTasks.length) * 100) : 0,
   };
 
   const selectedTask = selectedTaskId ? tasksInSpace.find((t) => t.id === selectedTaskId) ?? null : null;
@@ -432,16 +623,13 @@ export default function RallyApp({ workspaceName, currentUser, isGuestRole, spac
     };
   });
 
-  const chatItems = [
-    ...CHANNELS.map((c) => ({ ...c, displayName: "#" + c.name })),
-    ...DMS.map((c) => ({ ...c, displayName: c.name })),
-  ].map((c) => {
-    const active = c.key === activeChannel;
-    return { ...c, rowBg: active ? ACCENT_BG : "transparent", rowColor: active ? ACCENT_FG : "oklch(0.3 0.01 60)" };
+  const chatItems = channels.map((c) => {
+    const active = c.id === activeChannel;
+    return { key: c.id, displayName: "#" + c.name, rowBg: active ? ACCENT_BG : "transparent", rowColor: active ? ACCENT_FG : "oklch(0.3 0.01 60)" };
   });
 
-  const channelName = chatItems.find((c) => c.key === activeChannel)?.displayName ?? activeChannel;
-  const activeMessages = MESSAGES[activeChannel] ?? [];
+  const channelName = chatItems.find((c) => c.key === activeChannel)?.displayName ?? "";
+  const activeMessages = channels.find((c) => c.id === activeChannel)?.messages ?? [];
 
   const tabStyle = (key: typeof activeView) => ({
     bg: activeView === key ? "#fff" : "transparent",
@@ -453,9 +641,8 @@ export default function RallyApp({ workspaceName, currentUser, isGuestRole, spac
 
   const navColor = (ctx: typeof activeContext) => (!isGuest && activeContext === ctx ? "oklch(0.68 0.16 35)" : NEUTRAL_FG);
 
-  const topTitle = showChat ? "Chat" : showNotifications ? "Notifications" : isGuest ? "Shared with you" : `${activeSpace?.name ?? ""}`;
-  const unreadChatCount = CHANNELS.reduce((a, c) => a + c.unread, 0) + DMS.reduce((a, c) => a + c.unread, 0);
-  const unreadNotifCount = NOTIFICATIONS.filter((n) => !n.read).length;
+  const topTitle = showChat ? "Chat" : showNotifications ? "Notifications" : showManage ? "Manage" : isGuest ? "Shared with you" : `${activeSpace?.name ?? ""}`;
+  const unreadNotifCount = notifications.filter((n) => !n.read).length;
 
   if (bootLoading) {
     return <AppSkeleton />;
@@ -497,23 +684,6 @@ export default function RallyApp({ workspaceName, currentUser, isGuestRole, spac
           <div style={{ fontSize: 10.5, fontWeight: 800, padding: "3px 8px", borderRadius: 999, background: "oklch(0.9 0.05 35)", color: "oklch(0.4 0.12 35)", flex: "none" }}>GUEST</div>
         )}
         <div style={{ flex: 1 }} />
-        {!isGuestRole && !isGuest && (
-          <button
-            className="rl-guest-toggle"
-            onClick={toggleGuest}
-            style={{ alignItems: "center", gap: 6, fontSize: 12.5, fontWeight: 600, color: "oklch(0.42 0.01 60)", background: "transparent", border: "1px solid oklch(0.88 0.006 60)", borderRadius: 8, padding: "6px 12px", cursor: "pointer", flex: "none" }}
-          >
-            Preview as guest
-          </button>
-        )}
-        {!isGuestRole && isGuest && (
-          <button
-            onClick={toggleGuest}
-            style={{ fontSize: 12.5, fontWeight: 600, color: "oklch(0.42 0.01 60)", background: "transparent", border: "1px solid oklch(0.88 0.006 60)", borderRadius: 8, padding: "6px 12px", cursor: "pointer", flex: "none" }}
-          >
-            Exit guest view
-          </button>
-        )}
         <AvatarCircle a={currentUser} size={32} fontSize={12} />
         <button
           onClick={() => signOut({ callbackUrl: "/login" })}
@@ -560,9 +730,6 @@ export default function RallyApp({ workspaceName, currentUser, isGuestRole, spac
                     <div style={{ position: "absolute", inset: 5, borderRadius: "5px 5px 5px 1px", background: "oklch(0.5 0.01 60)" }} />
                   </div>
                   <div style={{ fontSize: 13, fontWeight: 700, color: !isGuest && activeContext === "chat" ? ACCENT_FG : "oklch(0.3 0.01 60)", flex: 1 }}>Chat</div>
-                  {unreadChatCount > 0 && (
-                    <div style={{ fontSize: 10.5, fontWeight: 800, background: "oklch(0.68 0.16 35)", color: "#fff", borderRadius: 999, padding: "1px 7px", minWidth: 16, textAlign: "center" }}>{unreadChatCount}</div>
-                  )}
                 </button>
                 <button
                   onClick={() => selectContext("notifications")}
@@ -574,6 +741,15 @@ export default function RallyApp({ workspaceName, currentUser, isGuestRole, spac
                     <div style={{ fontSize: 10.5, fontWeight: 800, background: "oklch(0.68 0.16 35)", color: "#fff", borderRadius: 999, padding: "1px 7px", minWidth: 16, textAlign: "center" }}>{unreadNotifCount}</div>
                   )}
                 </button>
+                {canManage && (
+                  <button
+                    onClick={() => selectContext("manage")}
+                    style={{ display: "flex", alignItems: "center", gap: 10, padding: 8, border: "none", borderRadius: 8, cursor: "pointer", textAlign: "left", background: activeContext === "manage" ? ACCENT_BG : "transparent" }}
+                  >
+                    <div style={{ width: 26, height: 26, borderRadius: 7, background: "oklch(0.5 0.01 60)", flex: "none" }} />
+                    <div style={{ fontSize: 13, fontWeight: 700, color: activeContext === "manage" ? ACCENT_FG : "oklch(0.3 0.01 60)", flex: 1 }}>Manage</div>
+                  </button>
+                )}
               </div>
             </>
           )}
@@ -612,6 +788,13 @@ export default function RallyApp({ workspaceName, currentUser, isGuestRole, spac
                 <div style={{ flex: 1 }} />
                 {!isGuest && (
                   <div style={{ marginBottom: 6, display: "flex", gap: 6 }}>
+                    <button
+                      onClick={() => setShowListForm((v) => !v)}
+                      disabled={!activeSpace}
+                      style={{ height: 32, padding: "0 12px", borderRadius: 8, border: "1px solid oklch(0.88 0.006 60)", background: "#fff", color: "oklch(0.35 0.01 60)", fontSize: 13, fontWeight: 700, cursor: "pointer", opacity: activeSpace ? 1 : 0.5 }}
+                    >
+                      + List
+                    </button>
                     <input
                       value={newTaskTitle}
                       onChange={(e) => setNewTaskTitle(e.target.value)}
@@ -630,6 +813,41 @@ export default function RallyApp({ workspaceName, currentUser, isGuestRole, spac
                   </div>
                 )}
               </div>
+
+              {showListForm && activeSpace && (
+                <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8, padding: "10px 20px", borderBottom: "1px solid oklch(0.9 0.006 60)", background: "oklch(0.97 0.006 60)", flex: "none" }}>
+                  <input
+                    value={newListName}
+                    onChange={(e) => setNewListName(e.target.value)}
+                    placeholder="List name"
+                    style={{ height: 30, border: "1px solid oklch(0.88 0.006 60)", borderRadius: 8, padding: "0 10px", fontSize: 13, fontFamily: "inherit" }}
+                  />
+                  <label style={{ display: "flex", alignItems: "center", gap: 5, fontSize: 12.5, color: "oklch(0.4 0.01 60)" }}>
+                    <input type="checkbox" checked={newListIsSprint} onChange={(e) => setNewListIsSprint(e.target.checked)} />
+                    Sprint
+                  </label>
+                  {newListIsSprint && (
+                    <>
+                      <input type="date" value={newListStart} onChange={(e) => setNewListStart(e.target.value)} style={{ height: 30, border: "1px solid oklch(0.88 0.006 60)", borderRadius: 8, padding: "0 8px", fontSize: 12.5, fontFamily: "inherit" }} />
+                      <span style={{ fontSize: 12, color: "oklch(0.55 0.01 60)" }}>to</span>
+                      <input type="date" value={newListEnd} onChange={(e) => setNewListEnd(e.target.value)} style={{ height: 30, border: "1px solid oklch(0.88 0.006 60)", borderRadius: 8, padding: "0 8px", fontSize: 12.5, fontFamily: "inherit" }} />
+                    </>
+                  )}
+                  <button
+                    onClick={handleCreateList}
+                    disabled={!newListName.trim() || creatingList}
+                    style={{ height: 30, padding: "0 12px", borderRadius: 8, border: "none", background: "oklch(0.68 0.16 35)", color: "#fff", fontSize: 12.5, fontWeight: 700, cursor: "pointer", opacity: !newListName.trim() || creatingList ? 0.6 : 1 }}
+                  >
+                    Create
+                  </button>
+                  <button
+                    onClick={() => setShowListForm(false)}
+                    style={{ height: 30, padding: "0 10px", borderRadius: 8, border: "none", background: "transparent", color: "oklch(0.5 0.01 60)", fontSize: 12.5, cursor: "pointer" }}
+                  >
+                    Cancel
+                  </button>
+                </div>
+              )}
 
               {tasksLoading ? (
                 activeView === "board" ? <BoardSkeleton /> : <RowsSkeleton />
@@ -725,35 +943,59 @@ export default function RallyApp({ workspaceName, currentUser, isGuestRole, spac
                 </div>
               ) : (
                 <div style={{ flex: 1, overflowY: "auto", padding: 20 }}>
-                  <div style={{ background: "#fff", border: "1px solid oklch(0.91 0.006 60)", borderRadius: 12, padding: 16, marginBottom: 16, display: "flex", flexDirection: "column", gap: 10 }}>
-                    <div style={{ display: "flex", alignItems: "baseline", gap: 10 }}>
-                      <div style={{ fontSize: 15, fontWeight: 800 }}>{sprintInfo.name}</div>
+                  {!isGuest && sprintLists.length > 1 && (
+                    <select
+                      value={sprintList?.id ?? ""}
+                      onChange={(e) => setSelectedSprintId(e.target.value)}
+                      style={{ marginBottom: 12, fontSize: 12.5, fontWeight: 700, padding: "6px 10px", borderRadius: 8, border: "1px solid oklch(0.88 0.006 60)", background: "#fff", fontFamily: "inherit" }}
+                    >
+                      {sprintLists.map((l) => (
+                        <option key={l.id} value={l.id}>{l.name}</option>
+                      ))}
+                    </select>
+                  )}
+                  {!sprintList ? (
+                    <div style={{ fontSize: 13, color: "oklch(0.55 0.01 60)", padding: "20px 4px" }}>
+                      {isGuest ? "Nothing shared yet." : "No sprint yet. Click “+ List” above and check “Sprint” to start one."}
                     </div>
-                    <div style={{ height: 8, borderRadius: 999, background: "oklch(0.92 0.006 60)", overflow: "hidden" }}>
-                      <div style={{ height: "100%", borderRadius: 999, background: "oklch(0.68 0.16 35)", width: `${sprintInfo.pct}%` }} />
-                    </div>
-                    <div style={{ fontSize: 12, color: "oklch(0.5 0.01 60)" }}>
-                      {sprintInfo.done} of {sprintInfo.total} tasks done
-                    </div>
-                  </div>
-                  {tasksInSpace.map((task) => {
-                    const statusColor = STATUSES.find((s) => s.key === task.status)!.color;
-                    const statusLabel = STATUSES.find((s) => s.key === task.status)!.label;
-                    return (
-                      <button
-                        key={task.id}
-                        onClick={() => openTask(task.id)}
-                        style={{ width: "100%", display: "flex", alignItems: "center", gap: 12, padding: "10px 12px", border: "none", borderTop: "1px solid oklch(0.93 0.006 60)", background: "#fff", cursor: "pointer", textAlign: "left" }}
-                      >
-                        <div style={{ flex: 1, display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
-                          <div style={{ width: 8, height: 8, borderRadius: "50%", background: statusColor, flex: "none" }} />
-                          <div style={{ fontSize: 13.5, fontWeight: 600, color: "oklch(0.22 0.01 60)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{task.title}</div>
+                  ) : (
+                    <>
+                      <div style={{ background: "#fff", border: "1px solid oklch(0.91 0.006 60)", borderRadius: 12, padding: 16, marginBottom: 16, display: "flex", flexDirection: "column", gap: 10 }}>
+                        <div style={{ display: "flex", alignItems: "baseline", gap: 10 }}>
+                          <div style={{ fontSize: 15, fontWeight: 800 }}>{sprintInfo.name}</div>
+                          {(sprintList.sprintStart || sprintList.sprintEnd) && (
+                            <div style={{ fontSize: 12, color: "oklch(0.5 0.01 60)" }}>
+                              {sprintList.sprintStart ?? "?"} &rarr; {sprintList.sprintEnd ?? "?"}
+                            </div>
+                          )}
                         </div>
-                        <div style={{ fontSize: 11.5, color: "oklch(0.5 0.01 60)", width: 120 }}>{statusLabel}</div>
-                        <div style={{ width: 90, fontSize: 12, color: "oklch(0.5 0.01 60)" }}>{task.due}</div>
-                      </button>
-                    );
-                  })}
+                        <div style={{ height: 8, borderRadius: 999, background: "oklch(0.92 0.006 60)", overflow: "hidden" }}>
+                          <div style={{ height: "100%", borderRadius: 999, background: "oklch(0.68 0.16 35)", width: `${sprintInfo.pct}%` }} />
+                        </div>
+                        <div style={{ fontSize: 12, color: "oklch(0.5 0.01 60)" }}>
+                          {sprintInfo.done} of {sprintInfo.total} tasks done
+                        </div>
+                      </div>
+                      {sprintTasks.map((task) => {
+                        const statusColor = STATUSES.find((s) => s.key === task.status)!.color;
+                        const statusLabel = STATUSES.find((s) => s.key === task.status)!.label;
+                        return (
+                          <button
+                            key={task.id}
+                            onClick={() => openTask(task.id)}
+                            style={{ width: "100%", display: "flex", alignItems: "center", gap: 12, padding: "10px 12px", border: "none", borderTop: "1px solid oklch(0.93 0.006 60)", background: "#fff", cursor: "pointer", textAlign: "left" }}
+                          >
+                            <div style={{ flex: 1, display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+                              <div style={{ width: 8, height: 8, borderRadius: "50%", background: statusColor, flex: "none" }} />
+                              <div style={{ fontSize: 13.5, fontWeight: 600, color: "oklch(0.22 0.01 60)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{task.title}</div>
+                            </div>
+                            <div style={{ fontSize: 11.5, color: "oklch(0.5 0.01 60)", width: 120 }}>{statusLabel}</div>
+                            <div style={{ width: 90, fontSize: 12, color: "oklch(0.5 0.01 60)" }}>{task.due}</div>
+                          </button>
+                        );
+                      })}
+                    </>
+                  )}
                 </div>
               )}
             </div>
@@ -772,9 +1014,6 @@ export default function RallyApp({ workspaceName, currentUser, isGuestRole, spac
                     style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", border: "none", borderRadius: 8, background: ch.rowBg, cursor: "pointer", textAlign: "left" }}
                   >
                     <div style={{ fontSize: 13, fontWeight: 600, color: ch.rowColor, flex: 1, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{ch.displayName}</div>
-                    {ch.unread > 0 && (
-                      <div style={{ fontSize: 10, fontWeight: 800, background: "oklch(0.68 0.16 35)", color: "#fff", borderRadius: 999, padding: "1px 6px" }}>{ch.unread}</div>
-                    )}
                   </button>
                 ))}
               </div>
@@ -789,23 +1028,36 @@ export default function RallyApp({ workspaceName, currentUser, isGuestRole, spac
                   <ChatSkeleton />
                 ) : (
                   <div style={{ flex: 1, overflowY: "auto", padding: 16, display: "flex", flexDirection: "column", gap: 14 }}>
-                    {activeMessages.map((m, i) => (
-                      <div key={i} style={{ display: "flex", gap: 10 }}>
+                    {activeMessages.map((m) => (
+                      <div key={m.id} style={{ display: "flex", gap: 10 }}>
                         <AvatarCircle a={m.author} size={28} fontSize={10.5} />
                         <div style={{ display: "flex", flexDirection: "column", gap: 4, minWidth: 0 }}>
                           <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
                             <div style={{ fontSize: 13, fontWeight: 700 }}>{m.author.name}</div>
                             <div style={{ fontSize: 11, color: "oklch(0.55 0.01 60)" }}>{m.time}</div>
                           </div>
-                          <div style={{ fontSize: 13.5, lineHeight: 1.5, color: "oklch(0.28 0.01 60)" }}>{m.text}</div>
+                          <div style={{ fontSize: 13.5, lineHeight: 1.5, color: "oklch(0.28 0.01 60)" }}>{renderMentionNodes(m.text)}</div>
                         </div>
                       </div>
                     ))}
                   </div>
                 )}
                 <div style={{ flex: "none", display: "flex", gap: 8, padding: "12px 16px", borderTop: "1px solid oklch(0.9 0.006 60)" }}>
-                  <input placeholder={`Message ${channelName}`} style={{ flex: 1, border: "1px solid oklch(0.88 0.006 60)", borderRadius: 8, padding: "9px 12px", fontSize: 13, fontFamily: "inherit" }} />
-                  <button style={{ width: 38, height: 38, borderRadius: 8, border: "none", background: "oklch(0.68 0.16 35)", color: "#fff", fontWeight: 700, cursor: "pointer" }}>&uarr;</button>
+                  <MentionComposer
+                    value={messageBody}
+                    onChange={setMessageBody}
+                    candidates={channels.find((c) => c.id === activeChannel)?.members ?? []}
+                    onEnter={handleSendMessage}
+                    placeholder={`Message ${channelName} (@ to mention)`}
+                    inputStyle={{ width: "100%", border: "1px solid oklch(0.88 0.006 60)", borderRadius: 8, padding: "9px 12px", fontSize: 13, fontFamily: "inherit" }}
+                  />
+                  <button
+                    onClick={handleSendMessage}
+                    disabled={!messageBody.trim() || postingMessage}
+                    style={{ width: 38, height: 38, borderRadius: 8, border: "none", background: "oklch(0.68 0.16 35)", color: "#fff", fontWeight: 700, cursor: !messageBody.trim() || postingMessage ? "default" : "pointer", opacity: !messageBody.trim() || postingMessage ? 0.5 : 1 }}
+                  >
+                    &uarr;
+                  </button>
                 </div>
               </div>
             </div>
@@ -815,9 +1067,22 @@ export default function RallyApp({ workspaceName, currentUser, isGuestRole, spac
             (notifLoading ? (
               <NotificationsSkeleton />
             ) : (
-              <div style={{ flex: 1, overflowY: "auto", padding: 20, display: "flex", flexDirection: "column", gap: 2, maxWidth: 640 }}>
-                {NOTIFICATIONS.map((n) => (
-                  <div key={n.id} style={{ display: "flex", alignItems: "flex-start", gap: 12, padding: "14px 12px", borderRadius: 10, background: n.read ? "transparent" : "oklch(0.97 0.006 60)" }}>
+              <div style={{ flex: 1, overflowY: "auto", padding: 20, display: "flex", flexDirection: "column", gap: 10, maxWidth: 640 }}>
+                {unreadNotifCount > 0 && (
+                  <button
+                    onClick={() => markAllNotificationsRead()}
+                    style={{ alignSelf: "flex-end", fontSize: 12, fontWeight: 700, color: "oklch(0.68 0.16 35)", background: "none", border: "none", cursor: "pointer", padding: 0 }}
+                  >
+                    Mark all read
+                  </button>
+                )}
+                {notifications.length === 0 && <div style={{ fontSize: 13, color: MUTED_FG, padding: "14px 12px" }}>No notifications yet.</div>}
+                {notifications.map((n) => (
+                  <div
+                    key={n.id}
+                    onClick={() => handleOpenNotification(n)}
+                    style={{ display: "flex", alignItems: "flex-start", gap: 12, padding: "14px 12px", borderRadius: 10, cursor: "pointer", background: n.read ? "transparent" : "oklch(0.97 0.006 60)" }}
+                  >
                     <div style={{ width: 8, height: 8, borderRadius: "50%", marginTop: 6, background: n.read ? "oklch(0.85 0.006 60)" : "oklch(0.68 0.16 35)", flex: "none" }} />
                     <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
                       <div style={{ fontSize: 13.5, color: "oklch(0.25 0.01 60)", lineHeight: 1.4 }}>{n.text}</div>
@@ -827,6 +1092,216 @@ export default function RallyApp({ workspaceName, currentUser, isGuestRole, spac
                 ))}
               </div>
             ))}
+
+          {showManage && (
+            <div style={{ flex: 1, overflowY: "auto", padding: 20, display: "flex", flexDirection: "column", gap: 28, maxWidth: 640 }}>
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                <div style={{ fontSize: 13, fontWeight: 800, color: "oklch(0.3 0.01 60)" }}>Spaces</div>
+                {role === "OWNER" && (
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <input
+                      value={newSpaceName}
+                      onChange={(e) => setNewSpaceName(e.target.value)}
+                      onKeyDown={(e) => e.key === "Enter" && handleCreateSpace()}
+                      placeholder="New space name"
+                      style={{ flex: 1, border: "1px solid oklch(0.88 0.006 60)", borderRadius: 8, padding: "8px 12px", fontSize: 13, fontFamily: "inherit" }}
+                    />
+                    <button
+                      onClick={handleCreateSpace}
+                      disabled={!newSpaceName.trim() || creatingSpace}
+                      style={{ fontSize: 13, fontWeight: 700, padding: "8px 14px", borderRadius: 8, border: "none", background: "oklch(0.68 0.16 35)", color: "#fff", cursor: "pointer", opacity: !newSpaceName.trim() || creatingSpace ? 0.5 : 1 }}
+                    >
+                      Create
+                    </button>
+                  </div>
+                )}
+                <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                  {spaces.map((sp) => {
+                    const addable = members.filter((m) => !sp.members.some((sm) => sm.id === m.id));
+                    return (
+                      <div key={sp.id} style={{ border: "1px solid oklch(0.9 0.006 60)", borderRadius: 10, padding: 12, display: "flex", flexDirection: "column", gap: 8 }}>
+                        <div style={{ fontSize: 13.5, fontWeight: 700 }}>{sp.name}</div>
+                        <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                          {sp.members.map((m) => (
+                            <div key={m.id} style={{ display: "flex", alignItems: "center", gap: 6, background: "oklch(0.96 0.006 60)", borderRadius: 999, padding: "3px 6px 3px 3px" }}>
+                              <AvatarCircle a={m} size={20} fontSize={9} />
+                              <div style={{ fontSize: 12, fontWeight: 600 }}>{m.name}</div>
+                              {m.id !== currentUser.id && (
+                                <button
+                                  onClick={() => removeFromSpace(sp.id, m.id)}
+                                  style={{ border: "none", background: "transparent", cursor: "pointer", fontSize: 12, color: "oklch(0.5 0.01 60)", padding: "0 2px" }}
+                                >
+                                  &times;
+                                </button>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                        {addable.length > 0 && (
+                          <div style={{ display: "flex", gap: 6 }}>
+                            <select
+                              value={addMemberSelection[sp.id] ?? ""}
+                              onChange={(e) => setAddMemberSelection((s) => ({ ...s, [sp.id]: e.target.value }))}
+                              style={{ fontSize: 12.5, padding: "5px 8px", borderRadius: 8, border: "1px solid oklch(0.88 0.006 60)", background: "#fff", fontFamily: "inherit" }}
+                            >
+                              <option value="">Add existing member...</option>
+                              {addable.map((m) => (
+                                <option key={m.id} value={m.id}>{m.name}</option>
+                              ))}
+                            </select>
+                            <button
+                              onClick={() => handleAddMember(sp.id)}
+                              disabled={!addMemberSelection[sp.id]}
+                              style={{ fontSize: 12.5, fontWeight: 700, padding: "5px 10px", borderRadius: 8, border: "1px solid oklch(0.88 0.006 60)", background: "#fff", cursor: "pointer", opacity: addMemberSelection[sp.id] ? 1 : 0.5 }}
+                            >
+                              Add
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {role === "OWNER" && (
+                <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                  <div style={{ fontSize: 13, fontWeight: 800, color: "oklch(0.3 0.01 60)" }}>People</div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    {allMembers.map((m) => (
+                      <div key={m.id} style={{ display: "flex", alignItems: "center", gap: 10, border: "1px solid oklch(0.9 0.006 60)", borderRadius: 10, padding: "8px 12px" }}>
+                        <AvatarCircle a={m} size={24} fontSize={10} />
+                        <div style={{ flex: 1, minWidth: 0, fontSize: 13, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m.name}</div>
+                        {m.role === "OWNER" || m.id === currentUser.id ? (
+                          <span style={{ fontSize: 11.5, fontWeight: 700, color: "oklch(0.5 0.01 60)", textTransform: "capitalize" }}>{m.role.toLowerCase()}</span>
+                        ) : (
+                          <select
+                            value={m.role}
+                            onChange={(e) => handleSetMemberRole(m.id, e.target.value as "ADMIN" | "MEMBER")}
+                            disabled={savingRole === m.id}
+                            style={{ fontSize: 12.5, fontWeight: 700, padding: "4px 8px", borderRadius: 8, border: "1px solid oklch(0.88 0.006 60)", background: "#fff", fontFamily: "inherit", cursor: "pointer" }}
+                          >
+                            <option value="ADMIN">Admin</option>
+                            <option value="MEMBER">Member</option>
+                          </select>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                <div style={{ fontSize: 13, fontWeight: 800, color: "oklch(0.3 0.01 60)" }}>Invite someone</div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 8, border: "1px solid oklch(0.9 0.006 60)", borderRadius: 10, padding: 12 }}>
+                  <input
+                    value={inviteEmail}
+                    onChange={(e) => setInviteEmail(e.target.value)}
+                    type="email"
+                    placeholder="email@company.com"
+                    style={{ border: "1px solid oklch(0.88 0.006 60)", borderRadius: 8, padding: "8px 12px", fontSize: 13, fontFamily: "inherit" }}
+                  />
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <select
+                      value={inviteRole}
+                      onChange={(e) => {
+                        setInviteRole(e.target.value as typeof inviteRole);
+                        setInviteSpaceId("");
+                        setInviteListId("");
+                      }}
+                      style={{ fontSize: 13, padding: "8px 10px", borderRadius: 8, border: "1px solid oklch(0.88 0.006 60)", background: "#fff", fontFamily: "inherit" }}
+                    >
+                      {role === "OWNER" && <option value="ADMIN">Admin</option>}
+                      <option value="MEMBER">Member</option>
+                      <option value="GUEST">Guest</option>
+                    </select>
+                    {inviteRole === "MEMBER" && (
+                      <select
+                        value={inviteSpaceId}
+                        onChange={(e) => setInviteSpaceId(e.target.value)}
+                        style={{ flex: 1, fontSize: 13, padding: "8px 10px", borderRadius: 8, border: "1px solid oklch(0.88 0.006 60)", background: "#fff", fontFamily: "inherit" }}
+                      >
+                        <option value="">Which space?</option>
+                        {spaces.map((sp) => (
+                          <option key={sp.id} value={sp.id}>{sp.name}</option>
+                        ))}
+                      </select>
+                    )}
+                    {inviteRole === "ADMIN" && role === "OWNER" && (
+                      <select
+                        value={inviteSpaceId}
+                        onChange={(e) => setInviteSpaceId(e.target.value)}
+                        style={{ flex: 1, fontSize: 13, padding: "8px 10px", borderRadius: 8, border: "1px solid oklch(0.88 0.006 60)", background: "#fff", fontFamily: "inherit" }}
+                      >
+                        <option value="">Which space? (optional, assign later)</option>
+                        {spaces.map((sp) => (
+                          <option key={sp.id} value={sp.id}>{sp.name}</option>
+                        ))}
+                      </select>
+                    )}
+                    {inviteRole === "GUEST" && (
+                      <select
+                        value={inviteListId}
+                        onChange={(e) => setInviteListId(e.target.value)}
+                        style={{ flex: 1, fontSize: 13, padding: "8px 10px", borderRadius: 8, border: "1px solid oklch(0.88 0.006 60)", background: "#fff", fontFamily: "inherit" }}
+                      >
+                        <option value="">Which list?</option>
+                        {allLists.map((l) => (
+                          <option key={l.id} value={l.id}>{l.label}</option>
+                        ))}
+                      </select>
+                    )}
+                  </div>
+                  <button
+                    onClick={handleCreateInvite}
+                    disabled={!inviteEmail.trim() || creatingInvite || (inviteRole === "MEMBER" && !inviteSpaceId) || (inviteRole === "GUEST" && !inviteListId)}
+                    style={{ fontSize: 13, fontWeight: 700, padding: "8px 14px", borderRadius: 8, border: "none", background: "oklch(0.68 0.16 35)", color: "#fff", cursor: "pointer", opacity: !inviteEmail.trim() || creatingInvite ? 0.5 : 1 }}
+                  >
+                    Send invite
+                  </button>
+                  {inviteLink && (
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, background: "oklch(0.96 0.006 60)", borderRadius: 8, padding: "8px 10px" }}>
+                      <div style={{ fontSize: 12, color: "oklch(0.4 0.01 60)", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{inviteLink}</div>
+                      <button
+                        onClick={() => navigator.clipboard.writeText(inviteLink)}
+                        style={{ fontSize: 12, fontWeight: 700, padding: "4px 10px", borderRadius: 6, border: "1px solid oklch(0.88 0.006 60)", background: "#fff", cursor: "pointer" }}
+                      >
+                        Copy link
+                      </button>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                <div style={{ fontSize: 13, fontWeight: 800, color: "oklch(0.3 0.01 60)" }}>Pending invites</div>
+                {pendingInvites.length === 0 ? (
+                  <div style={{ fontSize: 13, color: "oklch(0.55 0.01 60)" }}>No pending invites.</div>
+                ) : (
+                  pendingInvites.map((inv) => (
+                    <div key={inv.id} style={{ display: "flex", alignItems: "center", gap: 10, border: "1px solid oklch(0.9 0.006 60)", borderRadius: 10, padding: "8px 12px" }}>
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: 13, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{inv.email}</div>
+                        <div style={{ fontSize: 11.5, color: "oklch(0.55 0.01 60)" }}>{inv.role.toLowerCase()}{inv.scope ? ` · ${inv.scope}` : ""}</div>
+                      </div>
+                      <button
+                        onClick={() => navigator.clipboard.writeText(inv.url)}
+                        style={{ fontSize: 12, fontWeight: 700, padding: "4px 10px", borderRadius: 6, border: "1px solid oklch(0.88 0.006 60)", background: "#fff", cursor: "pointer" }}
+                      >
+                        Copy link
+                      </button>
+                      <button
+                        onClick={() => revokeInvite(inv.id)}
+                        style={{ fontSize: 12, fontWeight: 700, padding: "4px 10px", borderRadius: 6, border: "none", background: "transparent", color: "oklch(0.5 0.15 25)", cursor: "pointer" }}
+                      >
+                        Revoke
+                      </button>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          )}
         </div>
       </div>
 
@@ -882,11 +1357,6 @@ export default function RallyApp({ workspaceName, currentUser, isGuestRole, spac
                 </button>
               ))}
             </div>
-            {!isGuestRole && (
-              <button onClick={toggleGuest} style={{ marginTop: "auto", fontSize: 13, fontWeight: 600, color: "oklch(0.4 0.01 60)", background: "transparent", border: "1px solid oklch(0.88 0.006 60)", borderRadius: 8, padding: "10px 12px", cursor: "pointer" }}>
-                Preview as guest
-              </button>
-            )}
           </div>
           <div style={{ flex: 1 }} onClick={toggleDrawer} />
         </div>
@@ -929,10 +1399,10 @@ export default function RallyApp({ workspaceName, currentUser, isGuestRole, spac
                         disabled={savingField === "assignee"}
                         style={{ fontSize: 12.5, fontWeight: 700, padding: "4px 8px", borderRadius: 8, border: "1px solid oklch(0.88 0.006 60)", background: "#fff", fontFamily: "inherit", cursor: "pointer" }}
                       >
-                        {members.some((m) => m.id === selectedTask.assignee.id) ? null : (
+                        {spaceMembers.some((m) => m.id === selectedTask.assignee.id) ? null : (
                           <option value={selectedTask.assignee.id}>{selectedTask.assignee.name}</option>
                         )}
-                        {members.map((m) => (
+                        {spaceMembers.map((m) => (
                           <option key={m.id} value={m.id}>{m.name}</option>
                         ))}
                       </select>
@@ -1020,13 +1490,14 @@ export default function RallyApp({ workspaceName, currentUser, isGuestRole, spac
                 <div>
                   <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.55 0.01 60)", textTransform: "uppercase", letterSpacing: "0.03em", marginBottom: 8 }}>Comments ({selectedTask.comments})</div>
                   <div style={{ display: "flex", gap: 8 }}>
-                    <input
+                    <MentionComposer
                       value={commentBody}
-                      onChange={(e) => setCommentBody(e.target.value)}
-                      onKeyDown={(e) => e.key === "Enter" && handlePostComment()}
-                      placeholder="Add a comment…"
+                      onChange={setCommentBody}
+                      candidates={spaceMembers}
+                      onEnter={handlePostComment}
+                      placeholder="Add a comment… (@ to mention)"
                       disabled={postingComment}
-                      style={{ flex: 1, border: "1px solid oklch(0.88 0.006 60)", borderRadius: 8, padding: "9px 12px", fontSize: 13, fontFamily: "inherit" }}
+                      inputStyle={{ width: "100%", border: "1px solid oklch(0.88 0.006 60)", borderRadius: 8, padding: "9px 12px", fontSize: 13, fontFamily: "inherit" }}
                     />
                     <button
                       onClick={handlePostComment}

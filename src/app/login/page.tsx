@@ -45,9 +45,9 @@ const ERROR_MESSAGES: Record<string, string> = {
 export default async function LoginPage({
   searchParams,
 }: {
-  searchParams: Promise<{ error?: string; sent?: string }>;
+  searchParams: Promise<{ error?: string; sent?: string; accepted?: string }>;
 }) {
-  const { error, sent } = await searchParams;
+  const { error, sent, accepted } = await searchParams;
   const errorMessage = error ? ERROR_MESSAGES[error] ?? ERROR_MESSAGES.Default : null;
 
   return (
@@ -103,6 +103,20 @@ export default async function LoginPage({
             }}
           >
             Check your email for a sign-in link.
+          </p>
+        )}
+        {accepted && (
+          <p
+            style={{
+              margin: 0,
+              fontSize: 13,
+              color: "oklch(0.4 0.1 150)",
+              background: "oklch(0.94 0.05 150)",
+              borderRadius: 8,
+              padding: "8px 12px",
+            }}
+          >
+            Invite accepted. Sign in with your password.
           </p>
         )}
         {errorMessage && (

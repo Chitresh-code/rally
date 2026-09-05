@@ -1,36 +1,99 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Rally
 
-## Getting Started
+Rally is a work management app for the team: workspaces, spaces, lists, tasks, sprints, chat, and invite based access control. It's built on Next.js, Prisma, and Postgres, with authentication handled by NextAuth.
 
-First, run the development server:
+There is no public signup. The very first user (the Owner) is created automatically the first time the server starts, based on an email address you set in your environment. Every other user is added by invite: an Owner invites Admins, and Admins invite Members and Guests into the specific spaces they manage.
+
+## Requirements
+
+- Node.js 20.19 or newer
+- A running Postgres server
+- npm
+
+## 1. Install dependencies
+
+```bash
+npm install
+```
+
+This also runs `prisma generate` automatically via the `postinstall` script.
+
+## 2. Set up Postgres
+
+You need a Postgres database and a user that can connect to it. If you don't already have Postgres running locally, install it (`brew install postgresql` on macOS, or run it in a container) and start it.
+
+Then create a database and user matching what the app expects. From a `psql` shell as a superuser:
+
+```sql
+CREATE USER rally WITH PASSWORD 'rally_dev_password';
+CREATE DATABASE rally_dev OWNER rally;
+```
+
+You can use different values, just make sure they match the `DATABASE_URL` you set in your `.env` file in the next step.
+
+## 3. Configure environment variables
+
+Copy the example file and fill it in:
+
+```bash
+cp .env.example .env
+```
+
+Variables you need to set:
+
+- `DATABASE_URL`, your Postgres connection string, matching whatever you created in step 2.
+- `APP_URL`, the base URL the app runs at, `http://localhost:3000` for local development.
+- `AUTH_SECRET`, a random secret used by NextAuth to sign sessions. Generate one with `openssl rand -base64 32`.
+- `EMAIL_SERVER` and `EMAIL_FROM`, SMTP settings used to send magic link and invite emails. See the email section below for local development.
+- `SEED_OWNER_EMAIL`, the email address that should become the workspace Owner. On first server start, if no Owner exists yet, an invite is created and sent to this address so they can set a password and log in.
+
+## 4. Run database migrations
+
+```bash
+npm run db:migrate
+```
+
+This creates all the tables the app needs. No seed data is created, the database starts empty except for whatever the app itself creates on first run.
+
+## 5. Start the app
 
 ```bash
 npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Open `http://localhost:3000` in your browser.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+On the very first run, the server will notice there's no Owner yet and create an invite for `SEED_OWNER_EMAIL`. It logs the invite link to the terminal and also tries to email it. Open that link, set a password, and you'll be redirected to the login page to sign in as the Owner.
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Testing the email server locally
 
-## Learn More
+Real email delivery needs a real SMTP provider, which you probably don't have set up in local development. Instead, run a local SMTP catcher so you can see what the app would send without actually emailing anyone.
 
-To learn more about Next.js, take a look at the following resources:
+[MailDev](https://github.com/maildev/maildev) works well for this and needs no setup beyond running it:
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+```bash
+npx maildev
+```
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+By default MailDev listens for SMTP on port 1025 and serves a web inbox at `http://localhost:1080`. This matches the default `EMAIL_SERVER` value in `.env.example`, so as long as MailDev is running before you trigger an invite, a magic link login, or the owner bootstrap invite, you can open `http://localhost:1080` in your browser and read the email there instead of checking a real inbox.
 
-## Deploy on Vercel
+If you don't run MailDev (or any SMTP server) locally, invite and login emails will simply fail to send, but the invite link is still logged to the terminal and shown in the app UI, so you can still copy and use it directly.
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+## Available scripts
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+- `npm run dev`, start the development server.
+- `npm run build`, build the app for production.
+- `npm run start`, run the production build.
+- `npm run lint`, run ESLint.
+- `npm run db:migrate`, run Prisma migrations against your database.
+- `npm run db:studio`, open Prisma Studio, a GUI for browsing and editing your database.
+
+## Resetting your local database
+
+If you want to wipe your local database and start over with no users or data:
+
+```bash
+npx prisma migrate reset
+```
+
+This drops all data and reapplies every migration. The next time you start the app, it will bootstrap a fresh Owner invite for whatever `SEED_OWNER_EMAIL` is set to.

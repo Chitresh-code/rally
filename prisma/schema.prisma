@@ -87,11 +87,14 @@ model User {
   memberships UserMembership[]
   guestShares GuestShare[]
 
-  assignedTasks Task[]    @relation("TaskAssignees")
-  createdTasks  Task[]    @relation("TaskCreator")
+  assignedTasks Task[]         @relation("TaskAssignees")
+  createdTasks  Task[]         @relation("TaskCreator")
   comments      Comment[]
   messages      Message[]
-  channels      Channel[] @relation("ChannelMembers")
+  channels      Channel[]      @relation("ChannelMembers")
+  spaceMembers  SpaceMember[]
+  invitesSent   Invite[]       @relation("InvitesSent")
+  notifications Notification[]
 }
 
 model Workspace {
@@ -104,6 +107,7 @@ model Workspace {
   spaces      Space[]
   channels    Channel[]
   guestShares GuestShare[]
+  invites     Invite[]
 }
 
 model UserMembership {
@@ -125,8 +129,22 @@ model Space {
   createdAt   DateTime @default(now())
   workspaceId String
 
-  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  workspace Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   lists     List[]
+  members   SpaceMember[]
+  invites   Invite[]
+}
+
+model SpaceMember {
+  id        String   @id @default(cuid())
+  spaceId   String
+  userId    String
+  createdAt DateTime @default(now())
+
+  space Space @relation(fields: [spaceId], references: [id], onDelete: Cascade)
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, spaceId])
 }
 
 model List {
@@ -141,6 +159,7 @@ model List {
   space       Space        @relation(fields: [spaceId], references: [id], onDelete: Cascade)
   tasks       Task[]
   guestShares GuestShare[]
+  invites     Invite[]
 }
 
 model Task {
@@ -162,12 +181,25 @@ model Task {
   parent    Task?  @relation("Subtasks", fields: [parentId], references: [id], onDelete: Cascade)
   subtasks  Task[] @relation("Subtasks")
 
-  assignees   User[]       @relation("TaskAssignees")
-  dependsOn   Task[]       @relation("TaskDependencies")
-  blocks      Task[]       @relation("TaskDependencies")
-  comments    Comment[]
-  attachments Attachment[]
-  messages    Message[]
+  assignees     User[]         @relation("TaskAssignees")
+  dependsOn     Task[]         @relation("TaskDependencies")
+  blocks        Task[]         @relation("TaskDependencies")
+  comments      Comment[]
+  attachments   Attachment[]
+  messages      Message[]
+  notifications Notification[]
+}
+
+model Notification {
+  id        String    @id @default(cuid())
+  userId    String
+  text      String
+  taskId    String?
+  createdAt DateTime  @default(now())
+  readAt    DateTime?
+
+  user User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  task Task? @relation(fields: [taskId], references: [id], onDelete: Cascade)
 }
 
 model Comment {
@@ -237,4 +269,27 @@ model GuestShare {
   list      List      @relation(fields: [listId], references: [id], onDelete: Cascade)
 
   @@unique([userId, listId])
+}
+
+// --- Invites ---
+// Onboarding is invite-only: an Owner invites Admins, Admins invite Members
+// (into spaces they manage) and Guests (into lists they can edit).
+
+model Invite {
+  id          String    @id @default(cuid())
+  email       String
+  role        Role
+  token       String    @unique
+  workspaceId String
+  invitedById String?
+  spaceId     String?
+  listId      String?
+  expiresAt   DateTime
+  acceptedAt  DateTime?
+  createdAt   DateTime  @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  invitedBy User?     @relation("InvitesSent", fields: [invitedById], references: [id])
+  space     Space?    @relation(fields: [spaceId], references: [id], onDelete: Cascade)
+  list      List?     @relation(fields: [listId], references: [id], onDelete: Cascade)
 }

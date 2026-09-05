@@ -6,12 +6,14 @@ Scope is split into Phase 1 (MVP, needed to actually replace ClickUp) and Phase 
 
 | Role | Access |
 |---|---|
-| Owner | Full control: billing, workspace settings, delete workspace |
-| Admin | Manage members, spaces, integrations, automations |
-| Member | Create/edit tasks, comment, chat, use everything inside assigned spaces |
+| Owner | Full control, sees every space, only one per workspace, bootstrapped from `SEED_OWNER_EMAIL` in `.env` (not signup, no password in env) |
+| Admin | Invites Members/Guests, but only into the specific spaces they're assigned to manage (`SpaceMember`) — not workspace-wide |
+| Member | Create/edit tasks and lists, comment, chat — scoped to the specific spaces they've been added to |
 | Guest | Restricted to specific lists/tasks shared with them, comment only, no visibility into the rest of the workspace |
 
 Guest access is a first class concern, not an afterthought, because clients need it.
+
+Onboarding is invite-only, no public signup. On server start, `src/instrumentation.ts` checks whether `SEED_OWNER_EMAIL` is already registered as the workspace Owner; if not, it creates an `Invite` for that email (emailed, and logged to the server console) the same way any other invite works. The Owner invites Admins; Admins invite Members (into spaces they manage) and Guests (into lists they can edit). An `Invite` row holds a token, target role, and target space/list; accepting it only sets the person's password and creates their account — it never signs them in, it sends them to `/login`. Someone already in the workspace is never re-invited; the Owner changes their role (Admin/Member) directly instead.
 
 ## Phase 1: MVP
 

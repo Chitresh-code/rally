@@ -53,6 +53,8 @@ erDiagram
     WORKSPACE ||--o{ USER_MEMBERSHIP : has
     USER ||--o{ USER_MEMBERSHIP : holds
     SPACE ||--o{ LIST : contains
+    SPACE ||--o{ SPACE_MEMBER : grants
+    SPACE_MEMBER }o--|| USER : "admin or member of"
     LIST ||--o{ TASK : contains
     TASK ||--o{ TASK : "subtask of"
     TASK ||--o{ COMMENT : has
@@ -67,13 +69,20 @@ erDiagram
     WORKSPACE ||--o{ GUEST_SHARE : grants
     GUEST_SHARE }o--|| USER : "for guest"
     GUEST_SHARE }o--|| LIST : scopes
+    WORKSPACE ||--o{ INVITE : issues
+    USER ||--o{ INVITE : sends
+    INVITE }o--o| SPACE : "grants (admin/member)"
+    INVITE }o--o| LIST : "grants (guest)"
 
     USER_MEMBERSHIP {
         string role "owner admin member guest"
     }
 ```
 
-Key point: `GUEST_SHARE` is what makes guest access work. A guest user has a membership with role `guest`, and one or more `GUEST_SHARE` rows scoping them to specific lists. Every query that touches task data for a guest filters through their `GUEST_SHARE` rows, not through space level permissions.
+Key points:
+- `GUEST_SHARE` is what makes guest access work. A guest user has a membership with role `guest`, and one or more `GUEST_SHARE` rows scoping them to specific lists. Every query that touches task data for a guest filters through their `GUEST_SHARE` rows, not through space level permissions.
+- `SPACE_MEMBER` is what makes Admin/Member scoping work. `USER_MEMBERSHIP.role` says what *kind* of account someone has (can they invite people, are they billing-level); `SPACE_MEMBER` says *which spaces* an Admin or Member actually has access to. The Owner bypasses this and always sees every space.
+- `INVITE` is the only way accounts get created (no public signup), including the Owner: `src/instrumentation.ts` runs once on server start and, if `SEED_OWNER_EMAIL` isn't registered as Owner yet, creates an `INVITE` for it exactly like any other invite (`invitedById` is nullable for this system-generated case). A token carries the target role and, depending on that role, a target `SPACE` (Admin/Member) or `LIST` (Guest). Accepting an invite only sets the person's password and creates the `USER`, `USER_MEMBERSHIP`, and the corresponding `SPACE_MEMBER`/`GUEST_SHARE` row — it never signs them in, they land on `/login` afterward. Someone already in the workspace is never re-invited; role changes (Admin/Member) happen directly via `setMemberRole`, Owner-only.
 
 ## Mobile friendly approach
 
