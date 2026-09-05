@@ -1,69 +1,147 @@
-import Image from "next/image";
+import { redirect } from "next/navigation";
+import { auth } from "@/lib/auth";
+import { prisma } from "@/lib/prisma";
+import RallyApp, { type UiAvatar, type UiList, type UiSpace, type PriorityKey, type StatusKey } from "./RallyApp";
 
-export default function Home() {
-  return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert h-5 w-[100px]"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the{" "}
-            <code className="rounded bg-black/[.06] px-1.5 py-0.5 font-mono text-[0.9em] dark:bg-white/[.08]">
-              page.tsx
-            </code>{" "}
-            file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
-          </p>
-        </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert h-[14px] w-4"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={14}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
-        </div>
-      </main>
-    </div>
-  );
+const STATUS_MAP: Record<string, StatusKey> = {
+  TODO: "todo",
+  IN_PROGRESS: "in_progress",
+  IN_REVIEW: "review",
+  DONE: "done",
+};
+const PRIORITY_MAP: Record<string, PriorityKey> = {
+  LOW: "low",
+  MEDIUM: "normal",
+  HIGH: "high",
+  URGENT: "urgent",
+};
+
+const dueFormatter = new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric" });
+
+function hueFromString(s: string): number {
+  let hash = 0;
+  for (let i = 0; i < s.length; i++) hash = (hash * 31 + s.charCodeAt(i)) >>> 0;
+  return hash % 360;
+}
+
+function toAvatar(u: { id: string; name: string | null; email: string }): UiAvatar {
+  const label = u.name ?? u.email;
+  const initials = label
+    .split(" ")
+    .filter(Boolean)
+    .map((w) => w[0])
+    .slice(0, 2)
+    .join("")
+    .toUpperCase();
+  return { id: u.id, name: label, initials, hue: hueFromString(u.id) };
+}
+
+type TaskWithRelations = {
+  id: string;
+  title: string;
+  description: string | null;
+  status: string;
+  priority: string;
+  dueDate: Date | null;
+  comments: number;
+  assignees: { id: string; name: string | null; email: string }[];
+  createdBy: { id: string; name: string | null; email: string };
+  subtasks: { status: string }[];
+};
+
+function toUiTask(t: TaskWithRelations) {
+  const assignee = t.assignees[0] ?? t.createdBy;
+  return {
+    id: t.id,
+    title: t.title,
+    desc: t.description ?? "",
+    status: STATUS_MAP[t.status] ?? "todo",
+    priority: PRIORITY_MAP[t.priority] ?? "normal",
+    due: t.dueDate ? dueFormatter.format(t.dueDate) : "No due date",
+    dueDate: t.dueDate ? t.dueDate.toISOString().slice(0, 10) : null,
+    assignee: toAvatar(assignee),
+    checklist: t.subtasks.length ? { done: t.subtasks.filter((s) => s.status === "DONE").length, total: t.subtasks.length } : null,
+    comments: t.comments,
+  };
+}
+
+const taskInclude = {
+  assignees: { select: { id: true, name: true, email: true } },
+  createdBy: { select: { id: true, name: true, email: true } },
+  subtasks: { select: { status: true } },
+  _count: { select: { comments: true } },
+} as const;
+
+function flattenTaskCount<T extends { _count: { comments: number } }>(t: T) {
+  const { _count, ...rest } = t;
+  return { ...rest, comments: _count.comments };
+}
+
+export default async function Page() {
+  const session = await auth();
+  if (!session?.user?.id) redirect("/login");
+
+  const membership = await prisma.userMembership.findFirst({
+    where: { userId: session.user.id },
+    include: { workspace: true },
+    orderBy: { createdAt: "asc" },
+  });
+
+  if (!membership) {
+    return (
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100dvh", fontFamily: "system-ui, sans-serif" }}>
+        You&apos;re not a member of any workspace yet.
+      </div>
+    );
+  }
+
+  const isGuestRole = membership.role === "GUEST";
+  const currentUser = toAvatar({ id: session.user.id, name: session.user.name ?? null, email: session.user.email ?? "" });
+
+  const members = (
+    await prisma.userMembership.findMany({
+      where: { workspaceId: membership.workspaceId, role: { not: "GUEST" } },
+      include: { user: { select: { id: true, name: true, email: true } } },
+    })
+  ).map((m) => toAvatar(m.user));
+
+  if (isGuestRole) {
+    const lists = await prisma.list.findMany({
+      where: { guestShares: { some: { userId: session.user.id } } },
+      include: { tasks: { orderBy: { position: "asc" }, where: { parentId: null }, include: taskInclude } },
+    });
+
+    const sharedLists: UiList[] = lists.map((l) => ({
+      id: l.id,
+      name: l.name,
+      isSprint: l.isSprint,
+      tasks: l.tasks.map((t) => toUiTask(flattenTaskCount(t))),
+    }));
+
+    return <RallyApp workspaceName={membership.workspace.name} currentUser={currentUser} isGuestRole spaces={[]} sharedLists={sharedLists} members={[]} />;
+  }
+
+  const spacesRaw = await prisma.space.findMany({
+    where: { workspaceId: membership.workspaceId },
+    include: {
+      lists: {
+        include: { tasks: { orderBy: { position: "asc" }, where: { parentId: null }, include: taskInclude } },
+      },
+    },
+    orderBy: { createdAt: "asc" },
+  });
+
+  const spaces: UiSpace[] = spacesRaw.map((s) => ({
+    id: s.id,
+    name: s.name,
+    hue: hueFromString(s.id),
+    lists: s.lists.map((l) => ({
+      id: l.id,
+      name: l.name,
+      isSprint: l.isSprint,
+      tasks: l.tasks.map((t) => toUiTask(flattenTaskCount(t))),
+    })),
+  }));
+
+  return <RallyApp workspaceName={membership.workspace.name} currentUser={currentUser} isGuestRole={false} spaces={spaces} sharedLists={[]} members={members} />;
 }
