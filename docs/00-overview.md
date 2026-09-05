@@ -1,5 +1,9 @@
 # Overview
 
+## Name
+
+The project is called **Rally**.
+
 ## What we are building
 
 An internal work management tool for the organisation, similar in spirit to ClickUp, scoped to what the team actually uses day to day instead of the full ClickUp feature set.
