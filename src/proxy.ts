@@ -3,9 +3,11 @@ import { auth } from "@/lib/auth";
 
 export default auth((req) => {
   const isLoggedIn = !!req.auth;
-  const isLoginPage = req.nextUrl.pathname === "/login";
+  const { pathname } = req.nextUrl;
+  const isLoginPage = pathname === "/login";
+  const isPublicPage = isLoginPage || pathname.startsWith("/invite/");
 
-  if (!isLoggedIn && !isLoginPage) {
+  if (!isLoggedIn && !isPublicPage) {
     return NextResponse.redirect(new URL("/login", req.nextUrl.origin));
   }
   if (isLoggedIn && isLoginPage) {
@@ -14,5 +16,9 @@ export default auth((req) => {
 });
 
 export const config = {
-  matcher: ["/((?!api/auth|_next/static|_next/image|favicon.ico).*)"],
+  // Excludes anything with a file extension (static assets like /logo-black.png,
+  // /icon.png, /favicon.ico) in addition to api/auth and Next internals — the
+  // previous matcher only skipped favicon.ico and redirected every other public
+  // asset (and /invite/[token] itself) to /login for signed-out requests.
+  matcher: ["/((?!api/auth|_next/static|_next/image|.*\\..*).*)"],
 };

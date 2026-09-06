@@ -90,6 +90,7 @@ model User {
   assignedTasks Task[]         @relation("TaskAssignees")
   createdTasks  Task[]         @relation("TaskCreator")
   comments      Comment[]
+  attachments   Attachment[]
   messages      Message[]
   channels      Channel[]      @relation("ChannelMembers")
   spaceMembers  SpaceMember[]
@@ -98,10 +99,11 @@ model User {
 }
 
 model Workspace {
-  id        String   @id @default(cuid())
-  name      String
-  slug      String   @unique
-  createdAt DateTime @default(now())
+  id              String   @id @default(cuid())
+  name            String
+  slug            String   @unique
+  slackWebhookUrl String?
+  createdAt       DateTime @default(now())
 
   memberships UserMembership[]
   spaces      Space[]
@@ -181,13 +183,30 @@ model Task {
   parent    Task?  @relation("Subtasks", fields: [parentId], references: [id], onDelete: Cascade)
   subtasks  Task[] @relation("Subtasks")
 
-  assignees     User[]         @relation("TaskAssignees")
-  dependsOn     Task[]         @relation("TaskDependencies")
-  blocks        Task[]         @relation("TaskDependencies")
+  assignees     User[]           @relation("TaskAssignees")
+  dependsOn     TaskDependency[] @relation("DependentTask")
+  dependents    TaskDependency[] @relation("DependsOnTask")
   comments      Comment[]
   attachments   Attachment[]
   messages      Message[]
   notifications Notification[]
+}
+
+// A row means `task` depends on `dependsOn` (i.e. `dependsOn` blocks `task`).
+// Modeled as an explicit join so direction is a real column, not inferred
+// from a symmetric self-relation (Prisma self-relations with the same
+// relation name on both sides are symmetric and can't represent a directed
+// edge — using two names here keeps dependsOn/dependents genuinely distinct).
+model TaskDependency {
+  id          String   @id @default(cuid())
+  taskId      String
+  dependsOnId String
+  createdAt   DateTime @default(now())
+
+  task      Task @relation("DependentTask", fields: [taskId], references: [id], onDelete: Cascade)
+  dependsOn Task @relation("DependsOnTask", fields: [dependsOnId], references: [id], onDelete: Cascade)
+
+  @@unique([taskId, dependsOnId])
 }
 
 model Notification {
@@ -214,13 +233,17 @@ model Comment {
 }
 
 model Attachment {
-  id        String   @id @default(cuid())
-  url       String
-  filename  String
-  createdAt DateTime @default(now())
-  taskId    String
+  id           String   @id @default(cuid())
+  url          String
+  filename     String
+  mimeType     String
+  size         Int
+  createdAt    DateTime @default(now())
+  taskId       String
+  uploadedById String
 
-  task Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  task       Task @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  uploadedBy User @relation(fields: [uploadedById], references: [id])
 }
 
 // --- Chat ---

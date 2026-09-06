@@ -7,6 +7,7 @@ import { auth } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
 import { sendMail } from "@/lib/mailer";
 import { mentionedUserIds } from "@/lib/mentions";
+import { MAX_ATTACHMENT_BYTES, deleteAttachmentFile, saveAttachmentFile } from "@/lib/storage";
 
 async function myMembership(userId: string) {
   return prisma.userMembership.findFirst({ where: { userId } });
@@ -15,6 +16,33 @@ async function myMembership(userId: string) {
 async function notify(userId: string, actorId: string, text: string, taskId?: string) {
   if (userId === actorId) return;
   await prisma.notification.create({ data: { userId, text, taskId } });
+
+  const user = await prisma.user.findUnique({ where: { id: userId }, select: { email: true, name: true } });
+  if (!user) return;
+
+  try {
+    await sendMail(user.email, "Rally notification", `${text}\n\n${process.env.APP_URL ?? "http://localhost:3000"}`);
+  } catch (err) {
+    console.error("Failed to send notification email", err);
+  }
+
+  // ponytail: incoming webhooks post to one fixed Slack channel, so this is
+  // a broadcast model (everyone in that channel sees every notification),
+  // not a per-user DM. Prefix the recipient's name so it's still legible.
+  const membership = await myMembership(userId);
+  const workspace = membership ? await prisma.workspace.findUnique({ where: { id: membership.workspaceId }, select: { slackWebhookUrl: true } }) : null;
+  if (workspace?.slackWebhookUrl) {
+    try {
+      const res = await fetch(workspace.slackWebhookUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: `${user.name ?? user.email}: ${text}` }),
+      });
+      if (!res.ok) console.error("Slack webhook rejected notification", res.status, await res.text());
+    } catch (err) {
+      console.error("Failed to send Slack notification", err);
+    }
+  }
 }
 
 async function filterWorkspaceMembers(workspaceId: string, ids: string[]): Promise<string[]> {
@@ -23,7 +51,7 @@ async function filterWorkspaceMembers(workspaceId: string, ids: string[]): Promi
   return rows.map((r) => r.userId);
 }
 
-async function assertListAccess(userId: string, listId: string) {
+export async function assertListAccess(userId: string, listId: string) {
   const list = await prisma.list.findUnique({
     where: { id: listId },
     include: {
@@ -309,14 +337,151 @@ export async function updateTaskDueDate(taskId: string, dueDate: string | null) 
   revalidatePath("/");
 }
 
-export async function updateTaskAssignee(taskId: string, userId: string) {
+export async function addTaskAssignee(taskId: string, userId: string) {
   const session = await auth();
   if (!session?.user?.id) return;
   await assertCanEditTask(session.user.id, taskId);
-  const task = await prisma.task.update({ where: { id: taskId }, data: { assignees: { set: [{ id: userId }] } } });
+
+  const task = await prisma.task.findUnique({ where: { id: taskId }, select: { title: true, listId: true } });
+  if (!task) throw new Error("Task not found");
+
+  const targetAccess = await assertListAccess(userId, task.listId).catch(() => null);
+  if (!targetAccess || targetAccess.isGuest) throw new Error("That person doesn't have access to this task's space");
+
+  await prisma.task.update({ where: { id: taskId }, data: { assignees: { connect: [{ id: userId }] } } });
   const actor = session.user.name ?? session.user.email ?? "Someone";
   await notify(userId, session.user.id, `${actor} assigned you to '${task.title}'`, taskId);
   revalidatePath("/");
+}
+
+export async function removeTaskAssignee(taskId: string, userId: string) {
+  const session = await auth();
+  if (!session?.user?.id) return;
+  await assertCanEditTask(session.user.id, taskId);
+  await prisma.task.update({ where: { id: taskId }, data: { assignees: { disconnect: [{ id: userId }] } } });
+  revalidatePath("/");
+}
+
+async function wouldCreateCycle(taskId: string, dependsOnId: string): Promise<boolean> {
+  if (taskId === dependsOnId) return true;
+  const visited = new Set<string>();
+  const stack = [dependsOnId];
+  while (stack.length) {
+    const current = stack.pop()!;
+    if (current === taskId) return true;
+    if (visited.has(current)) continue;
+    visited.add(current);
+    const deps = await prisma.taskDependency.findMany({ where: { taskId: current }, select: { dependsOnId: true } });
+    for (const d of deps) stack.push(d.dependsOnId);
+  }
+  return false;
+}
+
+export async function addTaskDependency(taskId: string, dependsOnId: string) {
+  const session = await auth();
+  if (!session?.user?.id) return;
+  if (taskId === dependsOnId) throw new Error("A task can't depend on itself");
+  await assertCanEditTask(session.user.id, taskId);
+
+  const other = await prisma.task.findUnique({ where: { id: dependsOnId }, select: { listId: true } });
+  if (!other) throw new Error("Task not found");
+  await assertListAccess(session.user.id, other.listId);
+
+  if (await wouldCreateCycle(taskId, dependsOnId)) throw new Error("That would create a circular dependency");
+
+  await prisma.taskDependency.upsert({
+    where: { taskId_dependsOnId: { taskId, dependsOnId } },
+    update: {},
+    create: { taskId, dependsOnId },
+  });
+  revalidatePath("/");
+}
+
+export async function removeTaskDependency(taskId: string, dependsOnId: string) {
+  const session = await auth();
+  if (!session?.user?.id) return;
+  await assertCanEditTask(session.user.id, taskId);
+  await prisma.taskDependency.deleteMany({ where: { taskId, dependsOnId } });
+  revalidatePath("/");
+}
+
+export async function uploadAttachment(taskId: string, formData: FormData) {
+  const session = await auth();
+  if (!session?.user?.id) return;
+  await assertCanEditTask(session.user.id, taskId);
+
+  const file = formData.get("file");
+  if (!(file instanceof File) || file.size === 0) throw new Error("No file provided");
+  if (file.size > MAX_ATTACHMENT_BYTES) throw new Error("File exceeds the 20MB limit");
+
+  const key = await saveAttachmentFile(file);
+  await prisma.attachment.create({
+    data: {
+      taskId,
+      url: key,
+      filename: file.name || "file",
+      mimeType: file.type || "application/octet-stream",
+      size: file.size,
+      uploadedById: session.user.id,
+    },
+  });
+  revalidatePath("/");
+}
+
+export async function deleteAttachment(attachmentId: string) {
+  const session = await auth();
+  if (!session?.user?.id) return;
+  const attachment = await prisma.attachment.findUnique({ where: { id: attachmentId }, select: { taskId: true, url: true } });
+  if (!attachment) return;
+  await assertCanEditTask(session.user.id, attachment.taskId);
+
+  await prisma.attachment.delete({ where: { id: attachmentId } });
+  await deleteAttachmentFile(attachment.url).catch((err) => console.error("Failed to delete attachment file", err));
+  revalidatePath("/");
+}
+
+export async function updateSlackWebhook(url: string) {
+  const session = await auth();
+  if (!session?.user?.id) return;
+  const membership = await myMembership(session.user.id);
+  if (!membership || membership.role !== "OWNER") throw new Error("Only the owner can change the Slack integration");
+
+  const trimmed = url.trim();
+  if (trimmed && !trimmed.startsWith("https://hooks.slack.com/")) throw new Error("That doesn't look like a Slack incoming webhook URL");
+
+  await prisma.workspace.update({ where: { id: membership.workspaceId }, data: { slackWebhookUrl: trimmed || null } });
+  revalidatePath("/");
+}
+
+export async function getOrCreateDirectChannel(otherUserId: string): Promise<string> {
+  const session = await auth();
+  if (!session?.user?.id) throw new Error("Not signed in");
+  if (otherUserId === session.user.id) throw new Error("Can't message yourself");
+
+  const membership = await myMembership(session.user.id);
+  if (!membership) throw new Error("Forbidden");
+
+  const other = await prisma.userMembership.findUnique({
+    where: { userId_workspaceId: { userId: otherUserId, workspaceId: membership.workspaceId } },
+  });
+  if (!other) throw new Error("That person isn't in your workspace");
+
+  const existing = await prisma.channel.findFirst({
+    where: {
+      workspaceId: membership.workspaceId,
+      isDirect: true,
+      AND: [{ members: { some: { id: session.user.id } } }, { members: { some: { id: otherUserId } } }],
+    },
+    select: { id: true },
+  });
+  if (existing) return existing.id;
+
+  const created = await prisma.channel.create({
+    data: { workspaceId: membership.workspaceId, isDirect: true, members: { connect: [{ id: session.user.id }, { id: otherUserId }] } },
+    select: { id: true },
+  });
+  revalidatePath("/");
+  return created.id;
 }
 
 export async function deleteTask(taskId: string) {
@@ -335,7 +500,7 @@ export async function updateTaskDescription(taskId: string, description: string)
   revalidatePath("/");
 }
 
-export async function postMessage(channelId: string, body: string) {
+export async function postMessage(channelId: string, body: string, parentMessageId?: string) {
   const session = await auth();
   if (!session?.user?.id) return;
   const trimmed = body.trim();
@@ -347,7 +512,12 @@ export async function postMessage(channelId: string, body: string) {
   });
   if (!channel || !channel.members.some((m) => m.id === session.user.id)) throw new Error("Forbidden");
 
-  await prisma.message.create({ data: { channelId, authorId: session.user.id, body: trimmed } });
+  if (parentMessageId) {
+    const parent = await prisma.message.findUnique({ where: { id: parentMessageId }, select: { channelId: true } });
+    if (!parent || parent.channelId !== channelId) throw new Error("Invalid thread");
+  }
+
+  await prisma.message.create({ data: { channelId, authorId: session.user.id, body: trimmed, parentMessageId: parentMessageId ?? null } });
 
   const actor = session.user.name ?? session.user.email ?? "Someone";
   const memberIds = new Set(channel.members.map((m) => m.id));

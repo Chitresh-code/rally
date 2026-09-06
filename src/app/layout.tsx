@@ -11,6 +11,9 @@ const manrope = Manrope({
 export const metadata: Metadata = {
   title: "Rally",
   description: "Team task, sprint, and chat workspace",
+  icons: {
+    icon: "/icon.png",
+  }
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {

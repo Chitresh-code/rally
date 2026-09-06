@@ -59,14 +59,16 @@ type TaskWithRelations = {
   status: string;
   priority: string;
   dueDate: Date | null;
-  comments: number;
   assignees: { id: string; name: string | null; email: string }[];
   createdBy: { id: string; name: string | null; email: string };
   subtasks: { status: string }[];
+  comments: { id: string; body: string; createdAt: Date; author: { id: string; name: string | null; email: string } }[];
+  attachments: { id: string; filename: string; mimeType: string; size: number; createdAt: Date; uploadedBy: { id: string; name: string | null; email: string } }[];
+  dependsOn: { dependsOn: { id: string; title: string; status: string } }[];
+  dependents: { task: { id: string; title: string; status: string } }[];
 };
 
 function toUiTask(t: TaskWithRelations) {
-  const assignee = t.assignees[0] ?? t.createdBy;
   return {
     id: t.id,
     title: t.title,
@@ -75,9 +77,12 @@ function toUiTask(t: TaskWithRelations) {
     priority: PRIORITY_MAP[t.priority] ?? "normal",
     due: t.dueDate ? dueFormatter.format(t.dueDate) : "No due date",
     dueDate: t.dueDate ? t.dueDate.toISOString().slice(0, 10) : null,
-    assignee: toAvatar(assignee),
+    assignees: t.assignees.map(toAvatar),
     checklist: t.subtasks.length ? { done: t.subtasks.filter((s) => s.status === "DONE").length, total: t.subtasks.length } : null,
-    comments: t.comments,
+    comments: t.comments.map((c) => ({ id: c.id, author: toAvatar(c.author), body: c.body, time: timeAgo(c.createdAt) })),
+    attachments: t.attachments.map((a) => ({ id: a.id, filename: a.filename, mimeType: a.mimeType, size: a.size, uploadedBy: toAvatar(a.uploadedBy), time: timeAgo(a.createdAt) })),
+    dependsOn: t.dependsOn.map((d) => ({ id: d.dependsOn.id, title: d.dependsOn.title, status: STATUS_MAP[d.dependsOn.status] ?? "todo" })),
+    dependents: t.dependents.map((d) => ({ id: d.task.id, title: d.task.title, status: STATUS_MAP[d.task.status] ?? "todo" })),
   };
 }
 
@@ -85,13 +90,11 @@ const taskInclude = {
   assignees: { select: { id: true, name: true, email: true } },
   createdBy: { select: { id: true, name: true, email: true } },
   subtasks: { select: { status: true } },
-  _count: { select: { comments: true } },
+  comments: { orderBy: { createdAt: "asc" }, include: { author: { select: { id: true, name: true, email: true } } } },
+  attachments: { orderBy: { createdAt: "asc" }, include: { uploadedBy: { select: { id: true, name: true, email: true } } } },
+  dependsOn: { include: { dependsOn: { select: { id: true, title: true, status: true } } } },
+  dependents: { include: { task: { select: { id: true, title: true, status: true } } } },
 } as const;
-
-function flattenTaskCount<T extends { _count: { comments: number } }>(t: T) {
-  const { _count, ...rest } = t;
-  return { ...rest, comments: _count.comments };
-}
 
 export default async function Page() {
   const session = await auth();
@@ -146,7 +149,7 @@ export default async function Page() {
       isSprint: l.isSprint,
       sprintStart: toDateStr(l.sprintStart),
       sprintEnd: toDateStr(l.sprintEnd),
-      tasks: l.tasks.map((t) => toUiTask(flattenTaskCount(t))),
+      tasks: l.tasks.map((t) => toUiTask(t)),
     }));
 
     return (
@@ -162,6 +165,7 @@ export default async function Page() {
         channels={[]}
         pendingInvites={[]}
         notifications={notifications}
+        slackWebhookUrl={null}
       />
     );
   }
@@ -177,17 +181,22 @@ export default async function Page() {
     orderBy: { createdAt: "asc" },
   });
 
-  const channels: UiChannel[] = channelsRaw.map((c) => ({
-    id: c.id,
-    name: c.name ?? "channel",
-    members: c.members.map(toAvatar),
-    messages: c.messages.map((m) => ({
-      id: m.id,
-      author: toAvatar(m.author),
-      text: m.body,
-      time: timeFormatter.format(m.createdAt),
-    })),
-  }));
+  const channels: UiChannel[] = channelsRaw.map((c) => {
+    const otherMember = c.isDirect ? c.members.find((m) => m.id !== session.user.id) : undefined;
+    return {
+      id: c.id,
+      name: c.isDirect ? (otherMember ? (otherMember.name ?? otherMember.email) : "Direct message") : c.name ?? "channel",
+      isDirect: c.isDirect,
+      members: c.members.map(toAvatar),
+      messages: c.messages.map((m) => ({
+        id: m.id,
+        author: toAvatar(m.author),
+        text: m.body,
+        time: timeFormatter.format(m.createdAt),
+        parentMessageId: m.parentMessageId,
+      })),
+    };
+  });
 
   const ownerMembership = await prisma.userMembership.findFirst({
     where: { workspaceId: membership.workspaceId, role: "OWNER" },
@@ -220,7 +229,7 @@ export default async function Page() {
         isSprint: l.isSprint,
         sprintStart: toDateStr(l.sprintStart),
         sprintEnd: toDateStr(l.sprintEnd),
-        tasks: l.tasks.map((t) => toUiTask(flattenTaskCount(t))),
+        tasks: l.tasks.map((t) => toUiTask(t)),
       })),
     };
   });
@@ -255,6 +264,7 @@ export default async function Page() {
       channels={channels}
       pendingInvites={pendingInvites}
       notifications={notifications}
+      slackWebhookUrl={role === "OWNER" ? membership.workspace.slackWebhookUrl : null}
     />
   );
 }

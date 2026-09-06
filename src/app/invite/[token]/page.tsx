@@ -1,3 +1,4 @@
+import Image from "next/image";
 import { redirect } from "next/navigation";
 import { prisma } from "@/lib/prisma";
 import { acceptInvite } from "@/app/actions";
@@ -12,10 +13,7 @@ function Shell({ children }: { children: React.ReactNode }) {
   return (
     <div style={{ minHeight: "100dvh", width: "100%", display: "flex", alignItems: "center", justifyContent: "center", background: "oklch(0.985 0.004 60)", padding: 16 }}>
       <div style={{ width: "100%", maxWidth: 380, background: "#fff", border: `1px solid ${BORDER}`, borderRadius: 16, padding: 32, display: "flex", flexDirection: "column", gap: 24 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <div style={{ width: 28, height: 28, borderRadius: 8, background: ACCENT, flex: "none" }} />
-          <span style={{ fontSize: 20, fontWeight: 800, color: "oklch(0.22 0.01 60)" }}>Rally</span>
-        </div>
+        <Image src="/logo-black.png" alt="Rally" width={2029} height={775} priority style={{ height: "auto", width: 80, maxWidth: 2029, maxHeight: 775, alignSelf: "center" }} />
         {children}
       </div>
     </div>
@@ -105,6 +103,7 @@ export default async function InvitePage({
               required
               minLength={8}
               placeholder="At least 8 characters"
+              suppressHydrationWarning
               style={{ fontSize: 14, padding: "10px 12px", borderRadius: 8, border: `1px solid ${BORDER}`, outline: "none", fontFamily: "inherit" }}
             />
           </label>

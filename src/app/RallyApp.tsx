@@ -1,26 +1,36 @@
 "use client";
 
-import { useEffect, useState, type ChangeEvent, type CSSProperties, type ReactNode } from "react";
+import { useState, useEffect, type ChangeEvent, type CSSProperties, type ReactNode } from "react";
+import Image from "next/image";
 import { signOut } from "next-auth/react";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import {
+  addTaskAssignee,
+  addTaskDependency,
   assignToSpace,
   createInvite,
   createList,
   createSpace,
   createTask,
+  deleteAttachment,
   deleteTask,
+  getOrCreateDirectChannel,
   markAllNotificationsRead,
   markNotificationRead,
   postComment,
   postMessage,
   removeFromSpace,
+  removeTaskAssignee,
+  removeTaskDependency,
   revokeInvite,
   setMemberRole,
-  updateTaskAssignee,
+  updateSlackWebhook,
   updateTaskDescription,
   updateTaskDueDate,
   updateTaskPriority,
   updateTaskStatus,
+  uploadAttachment,
 } from "./actions";
 import { activeMentionQuery, mentionToken, parseMentions } from "@/lib/mentions";
 
@@ -31,6 +41,10 @@ export type PriorityKey = "urgent" | "high" | "normal" | "low";
 export type StatusKey = "todo" | "in_progress" | "review" | "done";
 export type RoleKey = "OWNER" | "ADMIN" | "MEMBER" | "GUEST";
 
+export type UiComment = { id: string; author: UiAvatar; body: string; time: string };
+export type UiAttachment = { id: string; filename: string; mimeType: string; size: number; uploadedBy: UiAvatar; time: string };
+export type UiTaskRef = { id: string; title: string; status: StatusKey };
+
 export type UiTask = {
   id: string;
   title: string;
@@ -39,15 +53,18 @@ export type UiTask = {
   priority: PriorityKey;
   due: string;
   dueDate: string | null;
-  assignee: UiAvatar;
+  assignees: UiAvatar[];
   checklist: { done: number; total: number } | null;
-  comments: number;
+  comments: UiComment[];
+  attachments: UiAttachment[];
+  dependsOn: UiTaskRef[];
+  dependents: UiTaskRef[];
 };
 
 export type UiList = { id: string; name: string; isSprint: boolean; sprintStart: string | null; sprintEnd: string | null; tasks: UiTask[] };
 export type UiSpace = { id: string; name: string; hue: number; members: UiAvatar[]; lists: UiList[] };
-export type UiMessage = { id: string; author: UiAvatar; text: string; time: string };
-export type UiChannel = { id: string; name: string; members: UiAvatar[]; messages: UiMessage[] };
+export type UiMessage = { id: string; author: UiAvatar; text: string; time: string; parentMessageId: string | null };
+export type UiChannel = { id: string; name: string; isDirect: boolean; members: UiAvatar[]; messages: UiMessage[] };
 export type UiInvite = { id: string; email: string; role: string; scope: string | null; url: string };
 export type UiMember = UiAvatar & { role: RoleKey };
 export type UiNotification = { id: string; text: string; time: string; read: boolean; taskId: string | null };
@@ -64,6 +81,7 @@ export type RallyAppProps = {
   channels: UiChannel[];
   pendingInvites: UiInvite[];
   notifications: UiNotification[];
+  slackWebhookUrl: string | null;
 };
 
 const STATUSES: { key: StatusKey; label: string; color: string }[] = [
@@ -125,16 +143,80 @@ function Skel({ w, h, r = 6 }: { w: string | number; h: number; r?: number }) {
   return <div className="rl-skel" style={{ width: w, height: h, borderRadius: r, flex: "none" }} />;
 }
 
-/** Renders `@[Name](id)` mention tokens as just the name, no "@", highlighted. */
-function renderMentionNodes(text: string): ReactNode {
-  return parseMentions(text).map((seg, i) =>
-    seg.type === "mention" ? (
-      <span key={i} style={{ fontWeight: 700, color: "oklch(0.68 0.16 35)" }}>
-        {seg.name}
-      </span>
-    ) : (
-      <span key={i}>{seg.value}</span>
-    )
+/** Rewrites `@[Name](id)` mention tokens into markdown links on a private scheme, so a single markdown pass renders both. */
+function toMarkdownSource(text: string): string {
+  return parseMentions(text)
+    .map((seg) => (seg.type === "mention" ? `[@${seg.name}](rally-mention:${seg.userId})` : seg.value))
+    .join("");
+}
+
+/** Renders markdown (GFM) with `@mention` tokens highlighted instead of linked. Used for descriptions, comments, and chat. */
+function Markdown({ text }: { text: string }) {
+  if (!text.trim()) return null;
+  return (
+    <div className="rl-md">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          a: ({ href, children }) =>
+            href?.startsWith("rally-mention:") ? (
+              <span style={{ fontWeight: 700, color: "oklch(0.68 0.16 35)" }}>{children}</span>
+            ) : (
+              <a href={href} target="_blank" rel="noopener noreferrer">
+                {children}
+              </a>
+            ),
+        }}
+      >
+        {toMarkdownSource(text)}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+/** Overlapping avatar stack for multi-assignee display; shows a dashed placeholder when unassigned. */
+function AvatarStack({ avatars, size, fontSize }: { avatars: UiAvatar[]; size: number; fontSize: number }) {
+  if (avatars.length === 0) {
+    return <div style={{ width: size, height: size, borderRadius: "50%", border: "1.5px dashed oklch(0.8 0.006 60)", flex: "none" }} />;
+  }
+  const shown = avatars.slice(0, 3);
+  const extra = avatars.length - shown.length;
+  const overlap = Math.round(size * 0.35);
+  return (
+    <div style={{ display: "flex", alignItems: "center", flex: "none" }}>
+      {shown.map((a, i) => (
+        <div key={a.id} style={{ marginLeft: i === 0 ? 0 : -overlap, borderRadius: "50%", border: "2px solid #fff" }}>
+          <AvatarCircle a={a} size={size} fontSize={fontSize} />
+        </div>
+      ))}
+      {extra > 0 && (
+        <div
+          style={{
+            marginLeft: -overlap,
+            width: size,
+            height: size,
+            borderRadius: "50%",
+            background: "oklch(0.88 0.006 60)",
+            color: "oklch(0.4 0.01 60)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            fontSize: Math.max(8, fontSize - 1),
+            fontWeight: 700,
+            border: "2px solid #fff",
+            flex: "none",
+          }}
+        >
+          +{extra}
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -347,7 +429,7 @@ function AppSkeleton() {
 
 /* ---------- app ---------- */
 
-export default function RallyApp({ workspaceName, currentUser, isGuestRole, role, spaces, sharedLists, members, allMembers, channels, pendingInvites, notifications }: RallyAppProps) {
+export default function RallyApp({ currentUser, isGuestRole, role, spaces, sharedLists, members, allMembers, channels, pendingInvites, notifications, slackWebhookUrl }: RallyAppProps) {
   const bootLoading = useDelayedLoading("boot", 500);
 
   const [activeSpaceId, setActiveSpaceId] = useState<string>(spaces[0]?.id ?? "");
@@ -383,6 +465,16 @@ export default function RallyApp({ workspaceName, currentUser, isGuestRole, role
   const [creatingList, setCreatingList] = useState(false);
   const [selectedSprintId, setSelectedSprintId] = useState<string>("");
   const [savingRole, setSavingRole] = useState<string | null>(null);
+  const [editingDescTaskId, setEditingDescTaskId] = useState<string | null>(null);
+  const [taskPanelError, setTaskPanelError] = useState<string | null>(null);
+  const [uploadingAttachment, setUploadingAttachment] = useState(false);
+  const [showDmPicker, setShowDmPicker] = useState(false);
+  const [replyingTo, setReplyingTo] = useState<UiMessage | null>(null);
+  const [expandedThreads, setExpandedThreads] = useState<Set<string>>(new Set());
+  const [slackWebhookInput, setSlackWebhookInput] = useState(slackWebhookUrl ?? "");
+  const [savingSlack, setSavingSlack] = useState(false);
+  const [slackError, setSlackError] = useState<string | null>(null);
+  const [chatError, setChatError] = useState<string | null>(null);
 
   const isGuest = isGuestRole;
   const canManage = !isGuest && (role === "OWNER" || role === "ADMIN");
@@ -400,12 +492,16 @@ export default function RallyApp({ workspaceName, currentUser, isGuestRole, role
   const openTask = (id: string) => {
     setSelectedTaskId(id);
     setCommentBody("");
+    setEditingDescTaskId(null);
+    setTaskPanelError(null);
   };
   const closeTask = () => setSelectedTaskId(null);
   const toggleDrawer = () => setDrawerOpen((d) => !d);
   const selectChannel = (key: string) => {
     setActiveChannel(key);
     setMessageBody("");
+    setReplyingTo(null);
+    setChatError(null);
     setMobileChatShowList(false);
   };
   const backToChatList = () => setMobileChatShowList(true);
@@ -454,12 +550,79 @@ export default function RallyApp({ workspaceName, currentUser, isGuestRole, role
     }
   }
 
-  async function handleAssigneeChange(taskId: string, userId: string) {
+  async function handleAddAssignee(taskId: string, userId: string) {
     setSavingField("assignee");
+    setTaskPanelError(null);
     try {
-      await updateTaskAssignee(taskId, userId);
+      await addTaskAssignee(taskId, userId);
+    } catch (err) {
+      setTaskPanelError(err instanceof Error ? err.message : "Couldn't add assignee");
     } finally {
       setSavingField(null);
+    }
+  }
+
+  async function handleRemoveAssignee(taskId: string, userId: string) {
+    setSavingField("assignee");
+    try {
+      await removeTaskAssignee(taskId, userId);
+    } finally {
+      setSavingField(null);
+    }
+  }
+
+  async function handleAddDependency(taskId: string, dependsOnId: string) {
+    setTaskPanelError(null);
+    try {
+      await addTaskDependency(taskId, dependsOnId);
+    } catch (err) {
+      setTaskPanelError(err instanceof Error ? err.message : "Couldn't add dependency");
+    }
+  }
+
+  async function handleRemoveDependency(taskId: string, dependsOnId: string) {
+    await removeTaskDependency(taskId, dependsOnId);
+  }
+
+  async function handleUploadAttachment(taskId: string, file: File | null) {
+    if (!file) return;
+    setUploadingAttachment(true);
+    setTaskPanelError(null);
+    try {
+      const formData = new FormData();
+      formData.set("file", file);
+      await uploadAttachment(taskId, formData);
+    } catch (err) {
+      setTaskPanelError(err instanceof Error ? err.message : "Upload failed");
+    } finally {
+      setUploadingAttachment(false);
+    }
+  }
+
+  async function handleDeleteAttachment(attachmentId: string) {
+    await deleteAttachment(attachmentId);
+  }
+
+  async function handleStartDm(userId: string) {
+    setShowDmPicker(false);
+    setChatError(null);
+    try {
+      const channelId = await getOrCreateDirectChannel(userId);
+      selectChannel(channelId);
+    } catch (err) {
+      setChatError(err instanceof Error ? err.message : "Couldn't start conversation");
+    }
+  }
+
+  async function handleSaveSlackWebhook() {
+    setSavingSlack(true);
+    setSlackError(null);
+    try {
+      await updateSlackWebhook(slackWebhookInput);
+    } catch (err) {
+      setSlackError(err instanceof Error ? err.message : "Couldn't save Slack webhook");
+    } finally {
+      setSavingSlack(false);
     }
   }
 
@@ -514,8 +677,10 @@ export default function RallyApp({ workspaceName, currentUser, isGuestRole, role
     if (!body || !activeChannel || postingMessage) return;
     setPostingMessage(true);
     try {
-      await postMessage(activeChannel, body);
+      await postMessage(activeChannel, body, replyingTo?.id);
       setMessageBody("");
+      if (replyingTo) setExpandedThreads((s) => new Set(s).add(replyingTo.id));
+      setReplyingTo(null);
     } finally {
       setPostingMessage(false);
     }
@@ -625,11 +790,22 @@ export default function RallyApp({ workspaceName, currentUser, isGuestRole, role
 
   const chatItems = channels.map((c) => {
     const active = c.id === activeChannel;
-    return { key: c.id, displayName: "#" + c.name, rowBg: active ? ACCENT_BG : "transparent", rowColor: active ? ACCENT_FG : "oklch(0.3 0.01 60)" };
+    return { key: c.id, isDirect: c.isDirect, displayName: c.isDirect ? c.name : "#" + c.name, rowBg: active ? ACCENT_BG : "transparent", rowColor: active ? ACCENT_FG : "oklch(0.3 0.01 60)" };
   });
+  const groupChatItems = chatItems.filter((c) => !c.isDirect);
+  const dmChatItems = chatItems.filter((c) => c.isDirect);
+  const dmCandidates = members.filter((m) => m.id !== currentUser.id);
 
   const channelName = chatItems.find((c) => c.key === activeChannel)?.displayName ?? "";
   const activeMessages = channels.find((c) => c.id === activeChannel)?.messages ?? [];
+  const rootMessages = activeMessages.filter((m) => !m.parentMessageId);
+  const repliesByParent = new Map<string, UiMessage[]>();
+  for (const m of activeMessages) {
+    if (!m.parentMessageId) continue;
+    const list = repliesByParent.get(m.parentMessageId) ?? [];
+    list.push(m);
+    repliesByParent.set(m.parentMessageId, list);
+  }
 
   const tabStyle = (key: typeof activeView) => ({
     bg: activeView === key ? "#fff" : "transparent",
@@ -675,8 +851,7 @@ export default function RallyApp({ workspaceName, currentUser, isGuestRole, role
             <div style={{ width: 18, height: 2, background: "oklch(0.3 0.01 60)" }} />
           </button>
         )}
-        <div style={{ width: 26, height: 26, borderRadius: 7, background: "oklch(0.68 0.16 35)", flex: "none" }} />
-        <div style={{ fontWeight: 800, fontSize: 15, letterSpacing: "-0.01em", flex: "none" }}>Rally</div>
+        <Image src="/logo-black.png" alt="Rally" width={2029} height={775} priority style={{ height: "auto", width: 80, flex: "none", maxWidth: 2029, maxHeight: 775   }} />
         <div style={{ fontSize: 13.5, fontWeight: 600, color: "oklch(0.42 0.01 60)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", paddingLeft: 6, borderLeft: "1px solid oklch(0.9 0.006 60)", marginLeft: 2 }}>
           {topTitle}
         </div>
@@ -699,9 +874,6 @@ export default function RallyApp({ workspaceName, currentUser, isGuestRole, role
         <div className="rl-sidebar" style={{ width: 260, flex: "none", flexDirection: "column", borderRight: "1px solid oklch(0.9 0.006 60)", background: "oklch(0.97 0.006 60)", padding: "16px 12px", gap: 18, overflowY: "auto" }}>
           {!isGuest && (
             <>
-              <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.5 0.01 60)", letterSpacing: "0.04em", padding: "0 8px" }}>
-                {workspaceName.toUpperCase()}
-              </div>
               <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
                 <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.55 0.01 60)", textTransform: "uppercase", letterSpacing: "0.04em", padding: "0 8px 4px" }}>Spaces</div>
                 {spaceRows.map((sp) => (
@@ -876,6 +1048,7 @@ export default function RallyApp({ workspaceName, currentUser, isGuestRole, role
                       <div style={{ display: "flex", flexDirection: "column", gap: 10, overflowY: "auto" }}>
                         {col.tasks.map((task) => {
                           const priorityInfo = PRIORITY[task.priority];
+                          const blockedCount = task.dependsOn.filter((d) => d.status !== "done").length;
                           return (
                             <button
                               key={task.id}
@@ -896,9 +1069,14 @@ export default function RallyApp({ workspaceName, currentUser, isGuestRole, role
                                 <Pill bg={priorityInfo.bg} fg={priorityInfo.fg}>
                                   {priorityInfo.label}
                                 </Pill>
+                                {blockedCount > 0 && (
+                                  <Pill bg="oklch(0.9 0.09 25)" fg="oklch(0.4 0.15 25)">
+                                    Blocked &times;{blockedCount}
+                                  </Pill>
+                                )}
                                 <span style={{ fontSize: 11.5, color: "oklch(0.5 0.01 60)" }}>{task.due}</span>
                                 <div style={{ flex: 1 }} />
-                                <AvatarCircle a={task.assignee} size={22} fontSize={9.5} />
+                                <AvatarStack avatars={task.assignees} size={22} fontSize={9.5} />
                               </div>
                             </button>
                           );
@@ -935,7 +1113,7 @@ export default function RallyApp({ workspaceName, currentUser, isGuestRole, role
                         </div>
                         <div style={{ width: 90, fontSize: 12, color: "oklch(0.5 0.01 60)" }}>{task.due}</div>
                         <div style={{ width: 36, display: "flex", justifyContent: "flex-end" }}>
-                          <AvatarCircle a={task.assignee} size={22} fontSize={9.5} />
+                          <AvatarStack avatars={task.assignees} size={22} fontSize={9.5} />
                         </div>
                       </button>
                     );
@@ -1007,7 +1185,8 @@ export default function RallyApp({ workspaceName, currentUser, isGuestRole, role
                 className={`rl-chatlist ${mobileChatShowList ? "" : "rl-hide-mobile"}`}
                 style={{ width: 240, flex: "none", borderRight: "1px solid oklch(0.9 0.006 60)", flexDirection: "column", overflowY: "auto", padding: "12px 8px", gap: 2 }}
               >
-                {chatItems.map((ch) => (
+                <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.55 0.01 60)", textTransform: "uppercase", letterSpacing: "0.04em", padding: "0 8px 4px" }}>Channels</div>
+                {groupChatItems.map((ch) => (
                   <button
                     key={ch.key}
                     onClick={() => selectChannel(ch.key)}
@@ -1016,6 +1195,45 @@ export default function RallyApp({ workspaceName, currentUser, isGuestRole, role
                     <div style={{ fontSize: 13, fontWeight: 600, color: ch.rowColor, flex: 1, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{ch.displayName}</div>
                   </button>
                 ))}
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 8px 4px" }}>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.55 0.01 60)", textTransform: "uppercase", letterSpacing: "0.04em" }}>Direct messages</div>
+                  <button
+                    onClick={() => setShowDmPicker((v) => !v)}
+                    title="Start a direct message"
+                    style={{ border: "none", background: "transparent", cursor: "pointer", fontSize: 15, fontWeight: 700, color: "oklch(0.55 0.01 60)", lineHeight: 1, padding: "0 4px" }}
+                  >
+                    +
+                  </button>
+                </div>
+                {showDmPicker && (
+                  <select
+                    value=""
+                    onChange={(e) => e.target.value && handleStartDm(e.target.value)}
+                    style={{ margin: "0 8px 4px", fontSize: 12.5, padding: "6px 8px", borderRadius: 8, border: "1px solid oklch(0.88 0.006 60)", background: "#fff", fontFamily: "inherit" }}
+                  >
+                    <option value="">Message someone&hellip;</option>
+                    {dmCandidates.map((m) => (
+                      <option key={m.id} value={m.id}>{m.name}</option>
+                    ))}
+                  </select>
+                )}
+                {dmChatItems.map((ch) => (
+                  <button
+                    key={ch.key}
+                    onClick={() => selectChannel(ch.key)}
+                    style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", border: "none", borderRadius: 8, background: ch.rowBg, cursor: "pointer", textAlign: "left" }}
+                  >
+                    <div style={{ fontSize: 13, fontWeight: 600, color: ch.rowColor, flex: 1, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{ch.displayName}</div>
+                  </button>
+                ))}
+                {dmChatItems.length === 0 && !showDmPicker && (
+                  <div style={{ fontSize: 12, color: MUTED_FG, padding: "0 8px" }}>No conversations yet.</div>
+                )}
+                {chatError && (
+                  <div style={{ fontSize: 11.5, fontWeight: 600, color: "oklch(0.5 0.18 25)", background: "oklch(0.95 0.05 25)", borderRadius: 8, padding: "6px 8px", margin: "4px 8px 0" }}>
+                    {chatError}
+                  </div>
+                )}
               </div>
               <div className={`rl-chatthread ${mobileChatShowList ? "rl-hide-mobile" : ""}`} style={{ flex: 1, flexDirection: "column", minWidth: 0 }}>
                 <div style={{ flex: "none", display: "flex", alignItems: "center", gap: 8, padding: "10px 16px", borderBottom: "1px solid oklch(0.9 0.006 60)" }}>
@@ -1027,19 +1245,64 @@ export default function RallyApp({ workspaceName, currentUser, isGuestRole, role
                 {chatLoading ? (
                   <ChatSkeleton />
                 ) : (
-                  <div style={{ flex: 1, overflowY: "auto", padding: 16, display: "flex", flexDirection: "column", gap: 14 }}>
-                    {activeMessages.map((m) => (
-                      <div key={m.id} style={{ display: "flex", gap: 10 }}>
-                        <AvatarCircle a={m.author} size={28} fontSize={10.5} />
-                        <div style={{ display: "flex", flexDirection: "column", gap: 4, minWidth: 0 }}>
-                          <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
-                            <div style={{ fontSize: 13, fontWeight: 700 }}>{m.author.name}</div>
-                            <div style={{ fontSize: 11, color: "oklch(0.55 0.01 60)" }}>{m.time}</div>
+                  <div style={{ flex: 1, overflowY: "auto", padding: 16, display: "flex", flexDirection: "column", gap: 16 }}>
+                    {rootMessages.map((m) => {
+                      const replies = repliesByParent.get(m.id) ?? [];
+                      const expanded = expandedThreads.has(m.id);
+                      return (
+                        <div key={m.id} style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                          <div style={{ display: "flex", gap: 10 }}>
+                            <AvatarCircle a={m.author} size={28} fontSize={10.5} />
+                            <div style={{ display: "flex", flexDirection: "column", gap: 4, minWidth: 0, flex: 1 }}>
+                              <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+                                <div style={{ fontSize: 13, fontWeight: 700 }}>{m.author.name}</div>
+                                <div style={{ fontSize: 11, color: "oklch(0.55 0.01 60)" }}>{m.time}</div>
+                              </div>
+                              <Markdown text={m.text} />
+                              <button
+                                onClick={() => setReplyingTo(m)}
+                                style={{ alignSelf: "flex-start", border: "none", background: "none", fontSize: 11, fontWeight: 700, color: MUTED_FG, cursor: "pointer", padding: 0 }}
+                              >
+                                Reply
+                              </button>
+                            </div>
                           </div>
-                          <div style={{ fontSize: 13.5, lineHeight: 1.5, color: "oklch(0.28 0.01 60)" }}>{renderMentionNodes(m.text)}</div>
+                          {replies.length > 0 && (
+                            <div style={{ marginLeft: 38, display: "flex", flexDirection: "column", gap: 10, borderLeft: "2px solid oklch(0.92 0.006 60)", paddingLeft: 12 }}>
+                              {!expanded ? (
+                                <button
+                                  onClick={() => setExpandedThreads((s) => new Set(s).add(m.id))}
+                                  style={{ alignSelf: "flex-start", border: "none", background: "none", fontSize: 11.5, fontWeight: 700, color: "oklch(0.68 0.16 35)", cursor: "pointer", padding: 0 }}
+                                >
+                                  {replies.length} {replies.length === 1 ? "reply" : "replies"}
+                                </button>
+                              ) : (
+                                replies.map((r) => (
+                                  <div key={r.id} style={{ display: "flex", gap: 8 }}>
+                                    <AvatarCircle a={r.author} size={22} fontSize={9} />
+                                    <div style={{ display: "flex", flexDirection: "column", gap: 2, minWidth: 0 }}>
+                                      <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+                                        <div style={{ fontSize: 12.5, fontWeight: 700 }}>{r.author.name}</div>
+                                        <div style={{ fontSize: 10.5, color: "oklch(0.55 0.01 60)" }}>{r.time}</div>
+                                      </div>
+                                      <Markdown text={r.text} />
+                                    </div>
+                                  </div>
+                                ))
+                              )}
+                            </div>
+                          )}
                         </div>
-                      </div>
-                    ))}
+                      );
+                    })}
+                  </div>
+                )}
+                {replyingTo && (
+                  <div style={{ flex: "none", display: "flex", alignItems: "center", gap: 8, padding: "6px 16px", borderTop: "1px solid oklch(0.9 0.006 60)", fontSize: 12, color: MUTED_FG }}>
+                    Replying to <strong>{replyingTo.author.name}</strong>
+                    <button onClick={() => setReplyingTo(null)} style={{ marginLeft: "auto", border: "none", background: "none", cursor: "pointer", color: MUTED_FG, fontSize: 14 }}>
+                      &times;
+                    </button>
                   </div>
                 )}
                 <div style={{ flex: "none", display: "flex", gap: 8, padding: "12px 16px", borderTop: "1px solid oklch(0.9 0.006 60)" }}>
@@ -1048,7 +1311,7 @@ export default function RallyApp({ workspaceName, currentUser, isGuestRole, role
                     onChange={setMessageBody}
                     candidates={channels.find((c) => c.id === activeChannel)?.members ?? []}
                     onEnter={handleSendMessage}
-                    placeholder={`Message ${channelName} (@ to mention)`}
+                    placeholder={`Message ${channelName} (@ to mention, Markdown supported)`}
                     inputStyle={{ width: "100%", border: "1px solid oklch(0.88 0.006 60)", borderRadius: 8, padding: "9px 12px", fontSize: 13, fontFamily: "inherit" }}
                   />
                   <button
@@ -1095,6 +1358,34 @@ export default function RallyApp({ workspaceName, currentUser, isGuestRole, role
 
           {showManage && (
             <div style={{ flex: 1, overflowY: "auto", padding: 20, display: "flex", flexDirection: "column", gap: 28, maxWidth: 640 }}>
+              {role === "OWNER" && (
+                <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                  <div style={{ fontSize: 13, fontWeight: 800, color: "oklch(0.3 0.01 60)" }}>Slack notifications</div>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <input
+                      value={slackWebhookInput}
+                      onChange={(e) => setSlackWebhookInput(e.target.value)}
+                      placeholder="https://hooks.slack.com/services/..."
+                      style={{ flex: 1, border: "1px solid oklch(0.88 0.006 60)", borderRadius: 8, padding: "8px 12px", fontSize: 13, fontFamily: "inherit" }}
+                    />
+                    <button
+                      onClick={handleSaveSlackWebhook}
+                      disabled={savingSlack}
+                      style={{ fontSize: 13, fontWeight: 700, padding: "8px 14px", borderRadius: 8, border: "none", background: "oklch(0.68 0.16 35)", color: "#fff", cursor: "pointer", opacity: savingSlack ? 0.6 : 1 }}
+                    >
+                      Save
+                    </button>
+                  </div>
+                  <p style={{ fontSize: 12, color: MUTED_FG, margin: 0, lineHeight: 1.5 }}>
+                    Paste a Slack incoming webhook URL to mirror task and comment notifications into a channel. Leave blank to turn it off.
+                  </p>
+                  {slackError && (
+                    <div style={{ fontSize: 12.5, fontWeight: 600, color: "oklch(0.5 0.18 25)", background: "oklch(0.95 0.05 25)", borderRadius: 8, padding: "8px 12px" }}>
+                      {slackError}
+                    </div>
+                  )}
+                </div>
+              )}
               <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
                 <div style={{ fontSize: 13, fontWeight: 800, color: "oklch(0.3 0.01 60)" }}>Spaces</div>
                 {role === "OWNER" && (
@@ -1334,7 +1625,7 @@ export default function RallyApp({ workspaceName, currentUser, isGuestRole, role
         <div style={{ position: "fixed", inset: 0, background: "oklch(0 0 0 / 0.35)", zIndex: 60, display: "flex" }}>
           <div style={{ width: 280, height: "100%", background: "#fff", padding: "16px 12px", display: "flex", flexDirection: "column", gap: 18, overflowY: "auto" }}>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-              <div style={{ fontSize: 15, fontWeight: 800 }}>Rally</div>
+              <Image src="/logo-black.png" alt="Rally" width={2029} height={775} style={{ height: "auto", width: 80, maxWidth: 2029, maxHeight: 775 }} />
               <button onClick={toggleDrawer} style={{ border: "none", background: "oklch(0.95 0.006 60)", width: 30, height: 30, borderRadius: 8, fontSize: 16, cursor: "pointer" }}>
                 &times;
               </button>
@@ -1384,30 +1675,49 @@ export default function RallyApp({ workspaceName, currentUser, isGuestRole, role
                     &times;
                   </button>
                 </div>
-                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, padding: 14, background: "oklch(0.98 0.004 60)", borderRadius: 10 }}>
-                  <div>
-                    <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.55 0.01 60)", textTransform: "uppercase", letterSpacing: "0.03em", marginBottom: 4 }}>Assignee</div>
-                    {isGuest ? (
-                      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-                        <AvatarCircle a={selectedTask.assignee} size={22} fontSize={9.5} />
-                        <div style={{ fontSize: 13, fontWeight: 600 }}>{selectedTask.assignee.name}</div>
+                {taskPanelError && (
+                  <div style={{ fontSize: 12.5, fontWeight: 600, color: "oklch(0.5 0.18 25)", background: "oklch(0.95 0.05 25)", borderRadius: 8, padding: "8px 12px" }}>
+                    {taskPanelError}
+                  </div>
+                )}
+                <div>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.55 0.01 60)", textTransform: "uppercase", letterSpacing: "0.03em", marginBottom: 6 }}>Assignees</div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: isGuest ? 0 : 6 }}>
+                    {selectedTask.assignees.map((a) => (
+                      <div key={a.id} style={{ display: "flex", alignItems: "center", gap: 6, background: "oklch(0.96 0.006 60)", borderRadius: 999, padding: "3px 6px 3px 3px" }}>
+                        <AvatarCircle a={a} size={20} fontSize={9} />
+                        <span style={{ fontSize: 12, fontWeight: 600 }}>{a.name}</span>
+                        {!isGuest && (
+                          <button
+                            onClick={() => handleRemoveAssignee(selectedTask.id, a.id)}
+                            disabled={savingField === "assignee"}
+                            style={{ border: "none", background: "transparent", cursor: "pointer", fontSize: 12, color: "oklch(0.5 0.01 60)", padding: "0 2px" }}
+                          >
+                            &times;
+                          </button>
+                        )}
                       </div>
-                    ) : (
+                    ))}
+                    {selectedTask.assignees.length === 0 && <span style={{ fontSize: 12.5, color: MUTED_FG }}>Unassigned</span>}
+                  </div>
+                  {!isGuest && (() => {
+                    const addable = spaceMembers.filter((m) => !selectedTask.assignees.some((a) => a.id === m.id));
+                    return addable.length > 0 ? (
                       <select
-                        value={selectedTask.assignee.id}
-                        onChange={(e) => handleAssigneeChange(selectedTask.id, e.target.value)}
+                        value=""
+                        onChange={(e) => e.target.value && handleAddAssignee(selectedTask.id, e.target.value)}
                         disabled={savingField === "assignee"}
                         style={{ fontSize: 12.5, fontWeight: 700, padding: "4px 8px", borderRadius: 8, border: "1px solid oklch(0.88 0.006 60)", background: "#fff", fontFamily: "inherit", cursor: "pointer" }}
                       >
-                        {spaceMembers.some((m) => m.id === selectedTask.assignee.id) ? null : (
-                          <option value={selectedTask.assignee.id}>{selectedTask.assignee.name}</option>
-                        )}
-                        {spaceMembers.map((m) => (
+                        <option value="">+ Add assignee</option>
+                        {addable.map((m) => (
                           <option key={m.id} value={m.id}>{m.name}</option>
                         ))}
                       </select>
-                    )}
-                  </div>
+                    ) : null;
+                  })()}
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, padding: 14, background: "oklch(0.98 0.004 60)", borderRadius: 10 }}>
                   <div>
                     <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.55 0.01 60)", textTransform: "uppercase", letterSpacing: "0.03em", marginBottom: 4 }}>Priority</div>
                     {isGuest ? (
@@ -1459,17 +1769,35 @@ export default function RallyApp({ workspaceName, currentUser, isGuestRole, role
                   </div>
                 </div>
                 <div>
-                  <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.55 0.01 60)", textTransform: "uppercase", letterSpacing: "0.03em", marginBottom: 6 }}>Description</div>
-                  {isGuest ? (
-                    <div style={{ fontSize: 13.5, lineHeight: 1.6, color: "oklch(0.3 0.01 60)" }}>{selectedTask.desc || "No description."}</div>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
+                    <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.55 0.01 60)", textTransform: "uppercase", letterSpacing: "0.03em" }}>Description</div>
+                    {!isGuest && editingDescTaskId !== selectedTask.id && (
+                      <button
+                        onClick={() => setEditingDescTaskId(selectedTask.id)}
+                        style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.68 0.16 35)", background: "none", border: "none", cursor: "pointer", padding: 0 }}
+                      >
+                        Edit
+                      </button>
+                    )}
+                  </div>
+                  {isGuest || editingDescTaskId !== selectedTask.id ? (
+                    selectedTask.desc ? (
+                      <Markdown text={selectedTask.desc} />
+                    ) : (
+                      <div style={{ fontSize: 13.5, color: MUTED_FG }}>No description.</div>
+                    )
                   ) : (
                     <textarea
                       key={selectedTask.id}
                       defaultValue={selectedTask.desc}
-                      placeholder="Add a description…"
-                      onBlur={(e) => handleDescriptionBlur(selectedTask.id, e.target.value)}
+                      placeholder="Add a description… (Markdown supported)"
+                      onBlur={(e) => {
+                        handleDescriptionBlur(selectedTask.id, e.target.value);
+                        setEditingDescTaskId(null);
+                      }}
                       disabled={savingField === "desc"}
-                      rows={4}
+                      autoFocus
+                      rows={5}
                       style={{ width: "100%", fontSize: 13.5, lineHeight: 1.6, color: "oklch(0.3 0.01 60)", fontFamily: "inherit", border: "1px solid oklch(0.88 0.006 60)", borderRadius: 8, padding: "8px 10px", resize: "vertical" }}
                     />
                   )}
@@ -1487,15 +1815,116 @@ export default function RallyApp({ workspaceName, currentUser, isGuestRole, role
                     </div>
                   </div>
                 )}
+                {(() => {
+                  const dependencyCandidates = tasksInSpace.filter(
+                    (t) => t.id !== selectedTask.id && !selectedTask.dependsOn.some((d) => d.id === t.id)
+                  );
+                  return (
+                    <div>
+                      <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.55 0.01 60)", textTransform: "uppercase", letterSpacing: "0.03em", marginBottom: 8 }}>Blocked by</div>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 6 }}>
+                        {selectedTask.dependsOn.map((d) => (
+                          <div key={d.id} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                            <div style={{ width: 7, height: 7, borderRadius: "50%", background: STATUSES.find((s) => s.key === d.status)!.color, flex: "none" }} />
+                            <button onClick={() => openTask(d.id)} style={{ flex: 1, minWidth: 0, textAlign: "left", border: "none", background: "none", cursor: "pointer", padding: 0, fontSize: 12.5, fontWeight: 600, color: "oklch(0.3 0.01 60)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                              {d.title}
+                            </button>
+                            {!isGuest && (
+                              <button onClick={() => handleRemoveDependency(selectedTask.id, d.id)} style={{ border: "none", background: "none", cursor: "pointer", color: MUTED_FG, fontSize: 13, flex: "none" }}>
+                                &times;
+                              </button>
+                            )}
+                          </div>
+                        ))}
+                        {selectedTask.dependsOn.length === 0 && <div style={{ fontSize: 12.5, color: MUTED_FG }}>Not blocked by anything.</div>}
+                      </div>
+                      {!isGuest && dependencyCandidates.length > 0 && (
+                        <select
+                          value=""
+                          onChange={(e) => e.target.value && handleAddDependency(selectedTask.id, e.target.value)}
+                          style={{ fontSize: 12.5, fontWeight: 700, padding: "4px 8px", borderRadius: 8, border: "1px solid oklch(0.88 0.006 60)", background: "#fff", fontFamily: "inherit", cursor: "pointer" }}
+                        >
+                          <option value="">+ Add blocking task</option>
+                          {dependencyCandidates.map((t) => (
+                            <option key={t.id} value={t.id}>{t.title}</option>
+                          ))}
+                        </select>
+                      )}
+                      {selectedTask.dependents.length > 0 && (
+                        <>
+                          <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.55 0.01 60)", textTransform: "uppercase", letterSpacing: "0.03em", margin: "12px 0 8px" }}>Blocks</div>
+                          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                            {selectedTask.dependents.map((d) => (
+                              <div key={d.id} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                                <div style={{ width: 7, height: 7, borderRadius: "50%", background: STATUSES.find((s) => s.key === d.status)!.color, flex: "none" }} />
+                                <button onClick={() => openTask(d.id)} style={{ flex: 1, minWidth: 0, textAlign: "left", border: "none", background: "none", cursor: "pointer", padding: 0, fontSize: 12.5, fontWeight: 600, color: "oklch(0.3 0.01 60)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                  {d.title}
+                                </button>
+                              </div>
+                            ))}
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  );
+                })()}
                 <div>
-                  <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.55 0.01 60)", textTransform: "uppercase", letterSpacing: "0.03em", marginBottom: 8 }}>Comments ({selectedTask.comments})</div>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.55 0.01 60)", textTransform: "uppercase", letterSpacing: "0.03em", marginBottom: 8 }}>Attachments ({selectedTask.attachments.length})</div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: isGuest ? 0 : 8 }}>
+                    {selectedTask.attachments.map((a) => (
+                      <div key={a.id} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, border: "1px solid oklch(0.9 0.006 60)", borderRadius: 8, padding: "6px 8px" }}>
+                        <a
+                          href={`/api/attachments/${a.id}`}
+                          style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontWeight: 600, color: "oklch(0.3 0.01 60)" }}
+                        >
+                          {a.filename}
+                        </a>
+                        <span style={{ color: MUTED_FG, fontSize: 11, flex: "none" }}>{formatBytes(a.size)}</span>
+                        {!isGuest && (
+                          <button onClick={() => handleDeleteAttachment(a.id)} style={{ border: "none", background: "none", cursor: "pointer", color: "oklch(0.55 0.18 25)", fontSize: 13, flex: "none" }}>
+                            &times;
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                    {selectedTask.attachments.length === 0 && <div style={{ fontSize: 12.5, color: MUTED_FG }}>No attachments.</div>}
+                  </div>
+                  {!isGuest && (
+                    <input
+                      type="file"
+                      onChange={(e) => {
+                        handleUploadAttachment(selectedTask.id, e.target.files?.[0] ?? null);
+                        e.target.value = "";
+                      }}
+                      disabled={uploadingAttachment}
+                      style={{ fontSize: 12 }}
+                    />
+                  )}
+                </div>
+                <div>
+                  <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.55 0.01 60)", textTransform: "uppercase", letterSpacing: "0.03em", marginBottom: 8 }}>Comments ({selectedTask.comments.length})</div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 12, marginBottom: 10 }}>
+                    {selectedTask.comments.map((c) => (
+                      <div key={c.id} style={{ display: "flex", gap: 8 }}>
+                        <AvatarCircle a={c.author} size={24} fontSize={10} />
+                        <div style={{ display: "flex", flexDirection: "column", gap: 2, minWidth: 0, flex: 1 }}>
+                          <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+                            <span style={{ fontSize: 12.5, fontWeight: 700 }}>{c.author.name}</span>
+                            <span style={{ fontSize: 11, color: MUTED_FG }}>{c.time}</span>
+                          </div>
+                          <Markdown text={c.body} />
+                        </div>
+                      </div>
+                    ))}
+                    {selectedTask.comments.length === 0 && <div style={{ fontSize: 12.5, color: MUTED_FG }}>No comments yet.</div>}
+                  </div>
                   <div style={{ display: "flex", gap: 8 }}>
                     <MentionComposer
                       value={commentBody}
                       onChange={setCommentBody}
                       candidates={spaceMembers}
                       onEnter={handlePostComment}
-                      placeholder="Add a comment… (@ to mention)"
+                      placeholder="Add a comment… (@ to mention, Markdown supported)"
                       disabled={postingComment}
                       inputStyle={{ width: "100%", border: "1px solid oklch(0.88 0.006 60)", borderRadius: 8, padding: "9px 12px", fontSize: 13, fontFamily: "inherit" }}
                     />

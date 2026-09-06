@@ -1,3 +1,4 @@
+import Image from "next/image";
 import { redirect } from "next/navigation";
 import { AuthError } from "next-auth";
 import { signIn } from "@/lib/auth";
@@ -76,18 +77,7 @@ export default async function LoginPage({
         }}
       >
         <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-            <div
-              style={{
-                width: 28,
-                height: 28,
-                borderRadius: 8,
-                background: ACCENT,
-                flex: "none",
-              }}
-            />
-            <span style={{ fontSize: 20, fontWeight: 800, color: "oklch(0.22 0.01 60)" }}>Rally</span>
-          </div>
+          <Image src="/logo-black.png" alt="Rally" width={2029} height={775} priority style={{ height: "auto", width: 80, maxWidth: 2029, maxHeight: 775, alignSelf: "center" }} />
           <p style={{ margin: 0, fontSize: 14, color: MUTED }}>Sign in to your workspace</p>
         </div>
 
@@ -142,6 +132,7 @@ export default async function LoginPage({
               type="email"
               required
               placeholder="you@company.com"
+              suppressHydrationWarning
               style={{
                 fontSize: 14,
                 padding: "10px 12px",
@@ -159,6 +150,7 @@ export default async function LoginPage({
               type="password"
               required
               placeholder="••••••••"
+              suppressHydrationWarning
               style={{
                 fontSize: 14,
                 padding: "10px 12px",
@@ -200,6 +192,7 @@ export default async function LoginPage({
             type="email"
             required
             placeholder="you@company.com"
+            suppressHydrationWarning
             style={{
               fontSize: 14,
               padding: "10px 12px",
