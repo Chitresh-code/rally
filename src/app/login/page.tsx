@@ -46,9 +46,9 @@ const ERROR_MESSAGES: Record<string, string> = {
 export default async function LoginPage({
   searchParams,
 }: {
-  searchParams: Promise<{ error?: string; sent?: string; accepted?: string }>;
+  searchParams: Promise<{ error?: string; sent?: string; accepted?: string; reset?: string }>;
 }) {
-  const { error, sent, accepted } = await searchParams;
+  const { error, sent, accepted, reset } = await searchParams;
   const errorMessage = error ? ERROR_MESSAGES[error] ?? ERROR_MESSAGES.Default : null;
 
   return (
@@ -109,6 +109,20 @@ export default async function LoginPage({
             Invite accepted. Sign in with your password.
           </p>
         )}
+        {reset && (
+          <p
+            style={{
+              margin: 0,
+              fontSize: 13,
+              color: "oklch(0.4 0.1 150)",
+              background: "oklch(0.94 0.05 150)",
+              borderRadius: 8,
+              padding: "8px 12px",
+            }}
+          >
+            Password reset. Sign in with your new password.
+          </p>
+        )}
         {errorMessage && (
           <p
             style={{
@@ -144,7 +158,12 @@ export default async function LoginPage({
             />
           </label>
           <label style={{ display: "flex", flexDirection: "column", gap: 4, fontSize: 13, color: "oklch(0.35 0.01 60)" }}>
-            Password
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              Password
+              <a href="/forgot-password" style={{ fontSize: 12.5, fontWeight: 600, color: ACCENT }}>
+                Forgot password?
+              </a>
+            </div>
             <input
               name="password"
               type="password"
@@ -219,6 +238,18 @@ export default async function LoginPage({
             Send magic link
           </button>
         </form>
+
+        <p style={{ margin: 0, fontSize: 12, color: MUTED, textAlign: "center" }}>
+          By signing in, you agree to our{" "}
+          <a href="/terms-of-service.pdf" target="_blank" rel="noopener noreferrer" style={{ color: MUTED, textDecoration: "underline" }}>
+            Terms of Service
+          </a>{" "}
+          and{" "}
+          <a href="/privacy-policy.pdf" target="_blank" rel="noopener noreferrer" style={{ color: MUTED, textDecoration: "underline" }}>
+            Privacy Policy
+          </a>
+          .
+        </p>
       </div>
     </div>
   );

@@ -38,3 +38,4 @@ Out of scope for this doc. Assume the decision is made and we are building a foc
 - [Architecture](02-architecture.md): tech stack, data model, system diagram
 - [Roadmap](03-roadmap.md): build order and open questions
 - [Production readiness](04-production-readiness.md): deployment prerequisites and the local-to-production cutover checklist
+- [Architecture evolution](05-architecture-evolution.md): module plan, delivery order, and local acceptance checks

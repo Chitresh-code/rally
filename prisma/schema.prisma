@@ -93,16 +93,17 @@ model User {
   memberships UserMembership[]
   guestShares GuestShare[]
 
-  assignedTasks Task[]         @relation("TaskAssignees")
-  createdTasks  Task[]         @relation("TaskCreator")
-  comments      Comment[]
-  attachments   Attachment[]
-  messages      Message[]
-  channels      Channel[]      @relation("ChannelMembers")
-  spaceMembers  SpaceMember[]
-  invitesSent   Invite[]       @relation("InvitesSent")
-  notifications Notification[]
-  channelReads  ChannelRead[]
+  assignedTasks       Task[]               @relation("TaskAssignees")
+  createdTasks        Task[]               @relation("TaskCreator")
+  comments            Comment[]
+  attachments         Attachment[]
+  messages            Message[]
+  channels            Channel[]            @relation("ChannelMembers")
+  spaceMembers        SpaceMember[]
+  invitesSent         Invite[]             @relation("InvitesSent")
+  notifications       Notification[]
+  channelReads        ChannelRead[]
+  passwordResetTokens PasswordResetToken[]
 }
 
 model Workspace {
@@ -378,4 +379,14 @@ model Invite {
   invitedBy User?     @relation("InvitesSent", fields: [invitedById], references: [id])
   space     Space?    @relation(fields: [spaceId], references: [id], onDelete: Cascade)
   list      List?     @relation(fields: [listId], references: [id], onDelete: Cascade)
+}
+
+model PasswordResetToken {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  userId    String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 }

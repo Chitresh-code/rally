@@ -110,6 +110,12 @@ The interface should expose only the operations genuinely needed by callers, suc
 
 ### Migration order
 
+Current status: `src/lib/access.ts` owns list and editable-task authorization. `src/lib/tasks.ts` owns task creation, fields, assignees, checklists, custom fields, dependencies, attachment records, deletion, and intra-space moves. Server Actions provide session lookup, file storage, notification delivery, and route refresh.
+
+`src/lib/rally-app-data.ts` owns Prisma read queries, include shapes, and database-to-UI mapping. The root page handles authentication, redirect handling, and app rendering.
+
+`src/lib/rally-types.ts` owns shared view types. Client workflows and server read modules now share one source for task, list, space, chat, notification, and app-prop types.
+
 1. Introduce the access-control module without changing user-visible behavior.
 2. Move one vertical slice at a time, starting with task mutations, behind a task module that owns validation, authorization, persistence, and notification decisions.
 3. Reduce each server action to a framework adapter: parse input, invoke one domain operation, and refresh the relevant route.

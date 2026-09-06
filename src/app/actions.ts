@@ -9,6 +9,31 @@ import { prisma } from "@/lib/prisma";
 import { sendMail } from "@/lib/mailer";
 import { mentionedUserIds } from "@/lib/mentions";
 import { MAX_ATTACHMENT_BYTES, deleteAttachmentFile, saveAttachmentFile } from "@/lib/storage";
+import {
+  addChecklistItem as addChecklistItemOperation,
+  addTaskAssignee as addTaskAssigneeOperation,
+  addTaskDependency as addTaskDependencyOperation,
+  createTask as createTaskOperation,
+  createAttachment as createAttachmentOperation,
+  createCustomField as createCustomFieldOperation,
+  deleteAttachment as deleteAttachmentOperation,
+  deleteChecklistItem as deleteChecklistItemOperation,
+  deleteCustomField as deleteCustomFieldOperation,
+  deleteTask as deleteTaskOperation,
+  moveTaskToList as moveTaskToListOperation,
+  removeTaskAssignee as removeTaskAssigneeOperation,
+  removeTaskDependency as removeTaskDependencyOperation,
+  setCustomFieldValue as setCustomFieldValueOperation,
+  toggleChecklistItem as toggleChecklistItemOperation,
+  type CustomFieldTypeInput,
+  updateTaskDescription as updateTaskDescriptionOperation,
+  updateTaskDueDate as updateTaskDueDateOperation,
+  updateTaskPriority as updateTaskPriorityOperation,
+  updateTaskStatus as updateTaskStatusOperation,
+  updateTaskTitle as updateTaskTitleOperation,
+  type TaskPriorityInput,
+  type TaskStatusInput,
+} from "@/lib/tasks";
 
 async function myMembership(userId: string) {
   return prisma.userMembership.findFirst({ where: { userId } });
@@ -27,7 +52,11 @@ async function notify(userId: string, actorId: string | null, text: string, task
   if (enabled) {
     await prisma.notification.create({ data: { userId, text, taskId } });
     try {
-      await sendMail(user.email, "Rally notification", `${text}\n\n${process.env.APP_URL ?? "http://localhost:3000"}`);
+      await sendMail(user.email, "Rally notification", {
+        heading: "You have a new notification",
+        paragraphs: [text],
+        cta: { label: "Open Rally", url: process.env.APP_URL ?? "http://localhost:3000" },
+      });
     } catch (err) {
       console.error("Failed to send notification email", err);
     }
@@ -96,20 +125,7 @@ async function assertListAccess(userId: string, listId: string) {
 export async function createTask(listId: string, title: string) {
   const session = await auth();
   if (!session?.user?.id) return;
-  const trimmed = title.trim();
-  if (!trimmed) return;
-
-  const { isGuest } = await requireListAccess(session.user.id, listId);
-  if (isGuest) throw new Error("Guests cannot create tasks");
-
-  await prisma.task.create({
-    data: {
-      listId,
-      title: trimmed,
-      createdById: session.user.id,
-      assignees: { connect: [{ id: session.user.id }] },
-    },
-  });
+  await createTaskOperation(session.user.id, listId, title);
   revalidatePath("/");
 }
 
@@ -126,14 +142,14 @@ export async function createSpace(name: string) {
   revalidatePath("/");
 }
 
-async function assertManagesSpace(userId: string, membershipRole: string, spaceId: string) {
+export async function assertManagesSpace(userId: string, membershipRole: string, spaceId: string) {
   if (membershipRole === "OWNER") return;
   if (membershipRole !== "ADMIN") throw new Error("Forbidden");
   const isSpaceAdmin = await prisma.spaceMember.findUnique({ where: { userId_spaceId: { userId, spaceId } } });
   if (!isSpaceAdmin) throw new Error("You don't manage this space");
 }
 
-async function assertSpaceAccess(userId: string, membershipRole: string, spaceId: string) {
+export async function assertSpaceAccess(userId: string, membershipRole: string, spaceId: string) {
   if (membershipRole === "OWNER") return;
   const isSpaceMember = await prisma.spaceMember.findUnique({ where: { userId_spaceId: { userId, spaceId } } });
   if (!isSpaceMember) throw new Error("Forbidden");
@@ -249,7 +265,12 @@ export async function createInvite(input: { email: string; role: "ADMIN" | "MEMB
 
   const url = `${process.env.APP_URL ?? "http://localhost:3000"}/invite/${token}`;
   try {
-    await sendMail(email, "You're invited to Rally", `You've been invited to join a Rally workspace as ${input.role.toLowerCase()}.\n\nAccept your invite: ${url}`);
+    await sendMail(email, "You're invited to Rally", {
+      heading: "You're invited to Rally",
+      paragraphs: [`You've been invited to join a Rally workspace as ${input.role.toLowerCase()}.`],
+      cta: { label: "Accept invite", url },
+      footer: "This invite link expires in 7 days.",
+    });
   } catch (err) {
     console.error("Failed to send invite email", err);
   }
@@ -317,212 +338,118 @@ export async function acceptInvite(input: { token: string; name: string; passwor
   revalidatePath("/");
 }
 
-const STATUS_DB = { todo: "TODO", in_progress: "IN_PROGRESS", review: "IN_REVIEW", done: "DONE" } as const;
-const PRIORITY_DB = { low: "LOW", normal: "MEDIUM", high: "HIGH", urgent: "URGENT" } as const;
-
-async function assertCanEditTask(userId: string, taskId: string) {
-  await requireEditableTask(userId, taskId);
-}
-
-export async function updateTaskStatus(taskId: string, status: keyof typeof STATUS_DB) {
+export async function updateTaskStatus(taskId: string, status: TaskStatusInput) {
   const session = await auth();
   if (!session?.user?.id) return;
-  await requireEditableTask(session.user.id, taskId);
-  await prisma.task.update({ where: { id: taskId }, data: { status: STATUS_DB[status] } });
+  await updateTaskStatusOperation(session.user.id, taskId, status);
   revalidatePath("/");
 }
 
-export async function updateTaskPriority(taskId: string, priority: keyof typeof PRIORITY_DB) {
+export async function updateTaskPriority(taskId: string, priority: TaskPriorityInput) {
   const session = await auth();
   if (!session?.user?.id) return;
-  await assertCanEditTask(session.user.id, taskId);
-  await prisma.task.update({ where: { id: taskId }, data: { priority: PRIORITY_DB[priority] } });
+  await updateTaskPriorityOperation(session.user.id, taskId, priority);
   revalidatePath("/");
 }
 
 export async function updateTaskDueDate(taskId: string, dueDate: string | null) {
   const session = await auth();
   if (!session?.user?.id) return;
-  await assertCanEditTask(session.user.id, taskId);
-  await prisma.task.update({ where: { id: taskId }, data: { dueDate: dueDate ? new Date(dueDate) : null } });
+  await updateTaskDueDateOperation(session.user.id, taskId, dueDate);
   revalidatePath("/");
 }
 
 export async function addTaskAssignee(taskId: string, userId: string) {
   const session = await auth();
   if (!session?.user?.id) return;
-  await assertCanEditTask(session.user.id, taskId);
-
-  const task = await prisma.task.findUnique({ where: { id: taskId }, select: { title: true, listId: true } });
-  if (!task) throw new Error("Task not found");
-
-  const targetAccess = await assertListAccess(userId, task.listId).catch(() => null);
-  if (!targetAccess || targetAccess.isGuest) throw new Error("That person doesn't have access to this task's space");
-
-  await prisma.task.update({ where: { id: taskId }, data: { assignees: { connect: [{ id: userId }] } } });
+  const taskTitle = await addTaskAssigneeOperation(session.user.id, taskId, userId);
   const actor = session.user.name ?? session.user.email ?? "Someone";
-  await notify(userId, session.user.id, `${actor} assigned you to '${task.title}'`, taskId, "taskAssigned");
+  await notify(userId, session.user.id, `${actor} assigned you to '${taskTitle}'`, taskId, "taskAssigned");
   revalidatePath("/");
 }
 
 export async function removeTaskAssignee(taskId: string, userId: string) {
   const session = await auth();
   if (!session?.user?.id) return;
-  await assertCanEditTask(session.user.id, taskId);
-  await prisma.task.update({ where: { id: taskId }, data: { assignees: { disconnect: [{ id: userId }] } } });
+  await removeTaskAssigneeOperation(session.user.id, taskId, userId);
   revalidatePath("/");
 }
 
 export async function addChecklistItem(taskId: string, text: string) {
   const session = await auth();
   if (!session?.user?.id) return;
-  const trimmed = text.trim();
-  if (!trimmed) return;
-  await assertCanEditTask(session.user.id, taskId);
-
-  const count = await prisma.checklistItem.count({ where: { taskId } });
-  await prisma.checklistItem.create({ data: { taskId, text: trimmed, position: count } });
+  await addChecklistItemOperation(session.user.id, taskId, text);
   revalidatePath("/");
 }
 
 export async function toggleChecklistItem(itemId: string, done: boolean) {
   const session = await auth();
   if (!session?.user?.id) return;
-  const item = await prisma.checklistItem.findUnique({ where: { id: itemId }, select: { taskId: true } });
-  if (!item) throw new Error("Checklist item not found");
-  await assertCanEditTask(session.user.id, item.taskId);
-  await prisma.checklistItem.update({ where: { id: itemId }, data: { done } });
+  await toggleChecklistItemOperation(session.user.id, itemId, done);
   revalidatePath("/");
 }
 
 export async function deleteChecklistItem(itemId: string) {
   const session = await auth();
   if (!session?.user?.id) return;
-  const item = await prisma.checklistItem.findUnique({ where: { id: itemId }, select: { taskId: true } });
-  if (!item) return;
-  await assertCanEditTask(session.user.id, item.taskId);
-  await prisma.checklistItem.delete({ where: { id: itemId } });
+  await deleteChecklistItemOperation(session.user.id, itemId);
   revalidatePath("/");
 }
 
-export async function createCustomField(listId: string, name: string, type: "TEXT" | "NUMBER" | "DATE" | "DROPDOWN", options: string[]) {
+export async function createCustomField(listId: string, name: string, type: CustomFieldTypeInput, options: string[]) {
   const session = await auth();
   if (!session?.user?.id) return;
-  const trimmed = name.trim();
-  if (!trimmed) return;
-  const { isGuest } = await assertListAccess(session.user.id, listId);
-  if (isGuest) throw new Error("Guests cannot add custom fields");
-
-  const count = await prisma.customField.count({ where: { listId } });
-  await prisma.customField.create({
-    data: { listId, name: trimmed, type, options: type === "DROPDOWN" ? options.filter(Boolean) : [], position: count },
-  });
+  await createCustomFieldOperation(session.user.id, listId, name, type, options);
   revalidatePath("/");
 }
 
 export async function deleteCustomField(fieldId: string) {
   const session = await auth();
   if (!session?.user?.id) return;
-  const field = await prisma.customField.findUnique({ where: { id: fieldId }, select: { listId: true } });
-  if (!field) return;
-  const { isGuest } = await assertListAccess(session.user.id, field.listId);
-  if (isGuest) throw new Error("Guests cannot delete custom fields");
-  await prisma.customField.delete({ where: { id: fieldId } });
+  await deleteCustomFieldOperation(session.user.id, fieldId);
   revalidatePath("/");
 }
 
 export async function setCustomFieldValue(taskId: string, customFieldId: string, value: string) {
   const session = await auth();
   if (!session?.user?.id) return;
-  await assertCanEditTask(session.user.id, taskId);
-
-  if (!value.trim()) {
-    await prisma.customFieldValue.deleteMany({ where: { taskId, customFieldId } });
-  } else {
-    await prisma.customFieldValue.upsert({
-      where: { taskId_customFieldId: { taskId, customFieldId } },
-      update: { value },
-      create: { taskId, customFieldId, value },
-    });
-  }
+  await setCustomFieldValueOperation(session.user.id, taskId, customFieldId, value);
   revalidatePath("/");
-}
-
-async function wouldCreateCycle(taskId: string, dependsOnId: string): Promise<boolean> {
-  if (taskId === dependsOnId) return true;
-  const visited = new Set<string>();
-  const stack = [dependsOnId];
-  while (stack.length) {
-    const current = stack.pop()!;
-    if (current === taskId) return true;
-    if (visited.has(current)) continue;
-    visited.add(current);
-    const deps = await prisma.taskDependency.findMany({ where: { taskId: current }, select: { dependsOnId: true } });
-    for (const d of deps) stack.push(d.dependsOnId);
-  }
-  return false;
 }
 
 export async function addTaskDependency(taskId: string, dependsOnId: string) {
   const session = await auth();
   if (!session?.user?.id) return;
-  if (taskId === dependsOnId) throw new Error("A task can't depend on itself");
-  await assertCanEditTask(session.user.id, taskId);
-
-  const other = await prisma.task.findUnique({ where: { id: dependsOnId }, select: { listId: true } });
-  if (!other) throw new Error("Task not found");
-  await assertListAccess(session.user.id, other.listId);
-
-  if (await wouldCreateCycle(taskId, dependsOnId)) throw new Error("That would create a circular dependency");
-
-  await prisma.taskDependency.upsert({
-    where: { taskId_dependsOnId: { taskId, dependsOnId } },
-    update: {},
-    create: { taskId, dependsOnId },
-  });
+  await addTaskDependencyOperation(session.user.id, taskId, dependsOnId);
   revalidatePath("/");
 }
 
 export async function removeTaskDependency(taskId: string, dependsOnId: string) {
   const session = await auth();
   if (!session?.user?.id) return;
-  await assertCanEditTask(session.user.id, taskId);
-  await prisma.taskDependency.deleteMany({ where: { taskId, dependsOnId } });
+  await removeTaskDependencyOperation(session.user.id, taskId, dependsOnId);
   revalidatePath("/");
 }
 
 export async function uploadAttachment(taskId: string, formData: FormData) {
   const session = await auth();
   if (!session?.user?.id) return;
-  await assertCanEditTask(session.user.id, taskId);
+  await requireEditableTask(session.user.id, taskId);
 
   const file = formData.get("file");
   if (!(file instanceof File) || file.size === 0) throw new Error("No file provided");
   if (file.size > MAX_ATTACHMENT_BYTES) throw new Error("File exceeds the 20MB limit");
 
   const key = await saveAttachmentFile(file);
-  await prisma.attachment.create({
-    data: {
-      taskId,
-      url: key,
-      filename: file.name || "file",
-      mimeType: file.type || "application/octet-stream",
-      size: file.size,
-      uploadedById: session.user.id,
-    },
-  });
+  await createAttachmentOperation(session.user.id, taskId, { storageKey: key, filename: file.name || "file", mimeType: file.type || "application/octet-stream", size: file.size });
   revalidatePath("/");
 }
 
 export async function deleteAttachment(attachmentId: string) {
   const session = await auth();
   if (!session?.user?.id) return;
-  const attachment = await prisma.attachment.findUnique({ where: { id: attachmentId }, select: { taskId: true, url: true } });
-  if (!attachment) return;
-  await assertCanEditTask(session.user.id, attachment.taskId);
-
-  await prisma.attachment.delete({ where: { id: attachmentId } });
-  await deleteAttachmentFile(attachment.url).catch((err) => console.error("Failed to delete attachment file", err));
+  const storageKey = await deleteAttachmentOperation(session.user.id, attachmentId);
+  if (storageKey) await deleteAttachmentFile(storageKey).catch((err) => console.error("Failed to delete attachment file", err));
   revalidatePath("/");
 }
 
@@ -573,46 +500,28 @@ export async function getOrCreateDirectChannel(otherUserId: string): Promise<str
 export async function deleteTask(taskId: string) {
   const session = await auth();
   if (!session?.user?.id) return;
-  await assertCanEditTask(session.user.id, taskId);
-  await prisma.task.delete({ where: { id: taskId } });
+  await deleteTaskOperation(session.user.id, taskId);
   revalidatePath("/");
 }
 
 export async function updateTaskDescription(taskId: string, description: string) {
   const session = await auth();
   if (!session?.user?.id) return;
-  await assertCanEditTask(session.user.id, taskId);
-  await prisma.task.update({ where: { id: taskId }, data: { description: description.trim() || null } });
+  await updateTaskDescriptionOperation(session.user.id, taskId, description);
   revalidatePath("/");
 }
 
 export async function updateTaskTitle(taskId: string, title: string) {
   const session = await auth();
   if (!session?.user?.id) return;
-  const trimmed = title.trim();
-  if (!trimmed) return;
-  await assertCanEditTask(session.user.id, taskId);
-  await prisma.task.update({ where: { id: taskId }, data: { title: trimmed } });
+  await updateTaskTitleOperation(session.user.id, taskId, title);
   revalidatePath("/");
 }
 
 export async function moveTaskToList(taskId: string, listId: string) {
   const session = await auth();
   if (!session?.user?.id) return;
-  const task = await prisma.task.findUnique({ where: { id: taskId }, select: { listId: true } });
-  if (!task) throw new Error("Task not found");
-  await assertCanEditTask(session.user.id, taskId);
-  if (task.listId === listId) return;
-
-  const [currentList, targetList] = await Promise.all([
-    prisma.list.findUnique({ where: { id: task.listId }, select: { spaceId: true } }),
-    prisma.list.findUnique({ where: { id: listId }, select: { spaceId: true } }),
-  ]);
-  if (!targetList || !currentList || targetList.spaceId !== currentList.spaceId) {
-    throw new Error("Can't move a task to a different space");
-  }
-
-  await prisma.task.update({ where: { id: taskId }, data: { listId } });
+  await moveTaskToListOperation(session.user.id, taskId, listId);
   revalidatePath("/");
 }
 
@@ -637,6 +546,44 @@ export async function updatePassword(currentPassword: string, newPassword: strin
 
   const passwordHash = await bcrypt.hash(newPassword, 10);
   await prisma.user.update({ where: { id: session.user.id }, data: { passwordHash } });
+}
+
+const RESET_TTL_MS = 60 * 60 * 1000;
+
+export async function requestPasswordReset(email: string) {
+  const normalized = email.trim().toLowerCase();
+  if (!normalized) return;
+
+  const user = await prisma.user.findUnique({ where: { email: normalized } });
+  // Only ever act silently either way, so this can't be used to find out which emails have accounts.
+  if (!user?.passwordHash) return;
+
+  const token = crypto.randomBytes(32).toString("hex");
+  await prisma.passwordResetToken.create({
+    data: { token, userId: user.id, expiresAt: new Date(Date.now() + RESET_TTL_MS) },
+  });
+
+  const url = `${process.env.APP_URL ?? "http://localhost:3000"}/reset-password/${token}`;
+  try {
+    await sendMail(user.email, "Reset your Rally password", {
+      heading: "Reset your password",
+      paragraphs: ["We received a request to reset your Rally password."],
+      cta: { label: "Reset password", url },
+      footer: "This link expires in 1 hour. If you didn't request this, you can safely ignore this email.",
+    });
+  } catch (err) {
+    console.error("Failed to send password reset email", err);
+  }
+}
+
+export async function resetPassword(input: { token: string; password: string }) {
+  const reset = await prisma.passwordResetToken.findUnique({ where: { token: input.token } });
+  if (!reset || reset.expiresAt < new Date()) throw new Error("This reset link is invalid or has expired.");
+  if (input.password.length < 8) throw new Error("Password must be at least 8 characters");
+
+  const passwordHash = await bcrypt.hash(input.password, 10);
+  await prisma.user.update({ where: { id: reset.userId }, data: { passwordHash } });
+  await prisma.passwordResetToken.delete({ where: { token: input.token } });
 }
 
 export async function updateNotificationPrefs(prefs: Record<string, boolean>) {

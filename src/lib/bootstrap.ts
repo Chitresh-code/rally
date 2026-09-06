@@ -46,7 +46,12 @@ export async function ensureOwnerBootstrap() {
 
   console.log(`No owner yet — invite sent to ${ownerEmail}. Accept it here: ${url(token)}`);
   try {
-    await sendMail(ownerEmail, "Set up your Rally workspace", `You're the owner of a new Rally workspace. Set your password to get started: ${url(token)}`);
+    await sendMail(ownerEmail, "Set up your Rally workspace", {
+      heading: "Welcome to Rally",
+      paragraphs: ["You're the owner of a new Rally workspace. Set your password to get started."],
+      cta: { label: "Set your password", url: url(token) },
+      footer: "This link expires in 7 days.",
+    });
   } catch (err) {
     console.error("Failed to send owner invite email", err);
   }

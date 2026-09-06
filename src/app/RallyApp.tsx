@@ -1,10 +1,18 @@
 "use client";
 
-import { useState, useEffect, useMemo, type ChangeEvent, type CSSProperties, type ReactNode } from "react";
+import { useState, useEffect, useMemo } from "react";
 import Image from "next/image";
 import { signOut } from "next-auth/react";
-import ReactMarkdown from "react-markdown";
-import remarkGfm from "remark-gfm";
+import type { PriorityKey, RallyAppProps, StatusKey, UiAvatar, UiCustomField, UiList, UiMessage, UiNotification, UiTask } from "@/lib/rally-types";
+import { AvatarCircle, CopyButton, Markdown, MentionComposer, MUTED_FG, Pill, STATUSES } from "./components/primitives";
+import { TaskDetailHeader } from "./components/task-detail-header";
+import { TaskAssignees } from "./components/task-assignees";
+import { TaskDescription } from "./components/task-description";
+import { TaskChecklist } from "./components/task-checklist";
+import { TaskCustomFields } from "./components/task-custom-fields";
+import { TaskDependencies } from "./components/task-dependencies";
+import { TaskAttachments } from "./components/task-attachments";
+import { TaskComments } from "./components/task-comments";
 import {
   addChecklistItem,
   addTaskAssignee,
@@ -44,79 +52,16 @@ import {
   updateTaskTitle,
   uploadAttachment,
 } from "./actions";
-import { activeMentionQuery, mentionToken, parseMentions } from "@/lib/mentions";
 
 /* ---------- types (shaped server-side from real Prisma data) ---------- */
 
-export type UiAvatar = { id: string; name: string; initials: string; hue: number };
-export type PriorityKey = "urgent" | "high" | "normal" | "low";
-export type StatusKey = "todo" | "in_progress" | "review" | "done";
-export type RoleKey = "OWNER" | "ADMIN" | "MEMBER" | "GUEST";
-
-export type UiComment = { id: string; author: UiAvatar; body: string; time: string };
-export type UiAttachment = { id: string; filename: string; mimeType: string; size: number; uploadedBy: UiAvatar; time: string };
-export type UiTaskRef = { id: string; title: string; status: StatusKey };
-
-export type UiChecklistItem = { id: string; text: string; done: boolean };
-export type UiCustomField = { id: string; name: string; type: "TEXT" | "NUMBER" | "DATE" | "DROPDOWN"; options: string[] };
-export type UiCustomFieldValue = { fieldId: string; value: string };
-
-export type UiTask = {
-  id: string;
-  listId: string;
-  title: string;
-  desc: string;
-  status: StatusKey;
-  priority: PriorityKey;
-  due: string;
-  dueDate: string | null;
-  assignees: UiAvatar[];
-  createdBy: UiAvatar;
-  checklist: UiChecklistItem[];
-  customFieldValues: UiCustomFieldValue[];
-  comments: UiComment[];
-  attachments: UiAttachment[];
-  dependsOn: UiTaskRef[];
-  dependents: UiTaskRef[];
-};
-
-export type UiList = { id: string; name: string; isSprint: boolean; sprintStart: string | null; sprintEnd: string | null; tasks: UiTask[]; customFields: UiCustomField[] };
-export type UiSpace = { id: string; name: string; hue: number; members: UiAvatar[]; lists: UiList[] };
-export type UiMessage = { id: string; author: UiAvatar; text: string; time: string; parentMessageId: string | null };
-export type UiChannel = { id: string; name: string; isDirect: boolean; unread: number; members: UiAvatar[]; messages: UiMessage[] };
-export type UiInvite = { id: string; email: string; role: string; scope: string | null; url: string };
-export type UiMember = UiAvatar & { role: RoleKey };
-export type UiNotification = { id: string; text: string; time: string; read: boolean; taskId: string | null };
-
-export type RallyAppProps = {
-  workspaceName: string;
-  currentUser: UiAvatar;
-  currentUserEmail: string;
-  isGuestRole: boolean;
-  role: RoleKey;
-  spaces: UiSpace[];
-  sharedLists: UiList[];
-  members: UiAvatar[];
-  allMembers: UiMember[];
-  channels: UiChannel[];
-  pendingInvites: UiInvite[];
-  notifications: UiNotification[];
-  slackWebhookUrl: string | null;
-  notificationPrefs: Record<string, boolean> | null;
-};
+export type { PriorityKey, RallyAppProps, RoleKey, StatusKey, UiAttachment, UiAvatar, UiChannel, UiChecklistItem, UiComment, UiCustomField, UiCustomFieldValue, UiInvite, UiList, UiMember, UiMessage, UiNotification, UiSpace, UiTask, UiTaskRef } from "@/lib/rally-types";
 
 const NOTIF_PREF_DEFS: { key: string; label: string; group: string }[] = [
   { key: "taskAssigned", label: "Assigned to a task", group: "Tasks" },
   { key: "taskDue", label: "Task due soon", group: "Tasks" },
   { key: "comments", label: "Comments & mentions on tasks", group: "Tasks" },
   { key: "chatMentions", label: "Mentions in chat", group: "Chat" },
-];
-
-const STATUSES: { key: StatusKey; label: string; color: string }[] = [
-  { key: "todo", label: "To Do", color: "oklch(0.6 0.01 60)" },
-  { key: "in_progress", label: "In Progress", color: "oklch(0.6 0.14 240)" },
-  { key: "review", label: "Review", color: "oklch(0.7 0.14 70)" },
-  { key: "done", label: "Done", color: "oklch(0.6 0.13 150)" },
 ];
 
 const PRIORITY: Record<PriorityKey, { label: string; bg: string; fg: string }> = {
@@ -126,122 +71,20 @@ const PRIORITY: Record<PriorityKey, { label: string; bg: string; fg: string }> =
   low: { label: "Low", bg: "oklch(0.92 0.01 60)", fg: "oklch(0.45 0.01 60)" },
 };
 
-function avatarBg(hue: number) {
-  return `oklch(0.55 0.13 ${hue})`;
-}
-
 const ACCENT_BG = "oklch(0.93 0.05 35)";
 const ACCENT_FG = "oklch(0.35 0.12 35)";
 const NEUTRAL_FG = "oklch(0.4 0.01 60)";
-const MUTED_FG = "oklch(0.5 0.01 60)";
 
 /* ---------- small shared bits ---------- */
 
-function AvatarCircle({ a, size, fontSize }: { a: UiAvatar; size: number; fontSize: number }) {
-  return (
-    <div
-      style={{
-        width: size,
-        height: size,
-        borderRadius: "50%",
-        background: avatarBg(a.hue),
-        color: "#fff",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
-        fontSize,
-        fontWeight: 700,
-        flex: "none",
-      }}
-    >
-      {a.initials}
-    </div>
-  );
-}
-
-function Pill({ bg, fg, children }: { bg: string; fg: string; children: ReactNode }) {
-  return (
-    <span style={{ fontSize: 10.5, fontWeight: 700, padding: "2px 8px", borderRadius: 999, background: bg, color: fg }}>
-      {children}
-    </span>
-  );
-}
-
-/** A "Copy link" button that swaps to a "Copied!" confirmation state for 1.5s after a click. */
-function CopyButton({ text, label = "Copy link", style }: { text: string; label?: string; style?: CSSProperties }) {
-  const [copied, setCopied] = useState(false);
-  return (
-    <button
-      onClick={async () => {
-        await navigator.clipboard.writeText(text);
-        setCopied(true);
-        setTimeout(() => setCopied(false), 1500);
-      }}
-      style={{
-        border: "none",
-        background: "oklch(0.95 0.006 60)",
-        color: "inherit",
-        padding: "0 10px",
-        height: 30,
-        borderRadius: 8,
-        fontSize: 11.5,
-        fontWeight: 700,
-        cursor: "pointer",
-        flex: "none",
-        transition: "background 0.15s, color 0.15s",
-        ...style,
-        ...(copied ? { background: "oklch(0.6 0.13 150)", color: "#fff", border: "none" } : {}),
-      }}
-    >
-      {copied ? "Copied!" : label}
-    </button>
-  );
-}
 
 function Skel({ w, h, r = 6 }: { w: string | number; h: number; r?: number }) {
   return <div className="rl-skel" style={{ width: w, height: h, borderRadius: r, flex: "none" }} />;
 }
 
-/** Rewrites `@[Name](id)` mention tokens into markdown links on a private scheme, so a single markdown pass renders both. */
-function toMarkdownSource(text: string): string {
-  return parseMentions(text)
-    .map((seg) => (seg.type === "mention" ? `[@${seg.name}](rally-mention:${seg.userId})` : seg.value))
-    .join("");
-}
-
-/** Renders markdown (GFM) with `@mention` tokens highlighted instead of linked. Used for descriptions, comments, and chat. */
-function Markdown({ text }: { text: string }) {
-  if (!text.trim()) return null;
-  return (
-    <div className="rl-md">
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        components={{
-          a: ({ href, children }) =>
-            href?.startsWith("rally-mention:") ? (
-              <span style={{ fontWeight: 700, color: "oklch(0.68 0.16 35)" }}>{children}</span>
-            ) : (
-              <a href={href} target="_blank" rel="noopener noreferrer">
-                {children}
-              </a>
-            ),
-        }}
-      >
-        {toMarkdownSource(text)}
-      </ReactMarkdown>
-    </div>
-  );
-}
-
 function isOverdue(task: { dueDate: string | null; status: StatusKey }): boolean {
   if (!task.dueDate || task.status === "done") return false;
   return new Date(task.dueDate) < new Date(new Date().toDateString());
-}
-
-function formatBytes(n: number): string {
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  return `${(n / 1024 / 1024).toFixed(1)} MB`;
 }
 
 /** Clickable task preview used to unfurl a pasted task link in chat, and to give a task-related notification a quick-open target. */
@@ -307,7 +150,7 @@ function AvatarStack({ avatars, size, fontSize }: { avatars: UiAvatar[]; size: n
     <div style={{ display: "flex", alignItems: "center", flex: "none" }}>
       {shown.map((a, i) => (
         <div key={a.id} style={{ marginLeft: i === 0 ? 0 : -overlap, borderRadius: "50%", border: "2px solid #fff" }}>
-          <AvatarCircle a={a} size={size} fontSize={fontSize} />
+          <AvatarCircle avatar={a} size={size} fontSize={fontSize} />
         </div>
       ))}
       {extra > 0 && (
@@ -329,127 +172,6 @@ function AvatarStack({ avatars, size, fontSize }: { avatars: UiAvatar[]; size: n
           }}
         >
           +{extra}
-        </div>
-      )}
-    </div>
-  );
-}
-
-/** Text/number/date custom-field value editor with an explicit Save button (only enabled once the draft differs from the saved value). */
-function CustomFieldValueEditor({ type, value, onSave }: { type: "TEXT" | "NUMBER" | "DATE"; value: string; onSave: (v: string) => Promise<void> }) {
-  const [draft, setDraft] = useState(value);
-  const [saving, setSaving] = useState(false);
-  const dirty = draft !== value;
-
-  async function save() {
-    setSaving(true);
-    try {
-      await onSave(draft);
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  return (
-    <div style={{ display: "flex", flex: 1, gap: 6 }}>
-      <input
-        type={type === "NUMBER" ? "number" : type === "DATE" ? "date" : "text"}
-        value={draft}
-        onChange={(e) => setDraft(e.target.value)}
-        onKeyDown={(e) => e.key === "Enter" && dirty && save()}
-        style={{ flex: 1, fontSize: 12.5, padding: "4px 8px", borderRadius: 8, border: "1px solid oklch(0.88 0.006 60)", fontFamily: "inherit" }}
-      />
-      {dirty && (
-        <button
-          onClick={save}
-          disabled={saving}
-          style={{ flex: "none", fontSize: 11.5, fontWeight: 700, padding: "0 10px", borderRadius: 8, border: "none", background: "oklch(0.68 0.16 35)", color: "#fff", cursor: "pointer", opacity: saving ? 0.6 : 1 }}
-        >
-          Save
-        </button>
-      )}
-    </div>
-  );
-}
-
-/** A text input with "@" autocomplete that inserts a `@[Name](id)` mention token. */
-function MentionComposer({
-  value,
-  onChange,
-  candidates,
-  placeholder,
-  disabled,
-  onEnter,
-  inputStyle,
-}: {
-  value: string;
-  onChange: (v: string) => void;
-  candidates: UiAvatar[];
-  placeholder: string;
-  disabled?: boolean;
-  onEnter: () => void;
-  inputStyle: CSSProperties;
-}) {
-  const [mention, setMention] = useState<{ start: number; query: string } | null>(null);
-
-  function handleChange(e: ChangeEvent<HTMLInputElement>) {
-    const v = e.target.value;
-    onChange(v);
-    setMention(activeMentionQuery(v, e.target.selectionStart ?? v.length));
-  }
-
-  function pick(m: UiAvatar) {
-    if (!mention) return;
-    const before = value.slice(0, mention.start);
-    const after = value.slice(mention.start + 1 + mention.query.length);
-    onChange(`${before}${mentionToken(m.name, m.id)} ${after}`);
-    setMention(null);
-  }
-
-  const matches = mention ? candidates.filter((c) => c.name.toLowerCase().includes(mention.query.toLowerCase())).slice(0, 6) : [];
-
-  return (
-    <div style={{ position: "relative", flex: 1 }}>
-      <input
-        value={value}
-        onChange={handleChange}
-        onKeyDown={(e) => {
-          if (e.key === "Escape") setMention(null);
-          else if (e.key === "Enter" && !mention) onEnter();
-        }}
-        onBlur={() => setTimeout(() => setMention(null), 120)}
-        placeholder={placeholder}
-        disabled={disabled}
-        style={inputStyle}
-      />
-      {mention && matches.length > 0 && (
-        <div
-          style={{
-            position: "absolute",
-            bottom: "calc(100% + 4px)",
-            left: 0,
-            background: "#fff",
-            border: "1px solid oklch(0.88 0.006 60)",
-            borderRadius: 8,
-            boxShadow: "0 4px 16px rgba(0,0,0,0.1)",
-            overflow: "hidden",
-            zIndex: 20,
-            minWidth: 180,
-          }}
-        >
-          {matches.map((m) => (
-            <div
-              key={m.id}
-              onMouseDown={(e) => {
-                e.preventDefault();
-                pick(m);
-              }}
-              style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px 10px", cursor: "pointer", fontSize: 13 }}
-            >
-              <AvatarCircle a={m} size={20} fontSize={9} />
-              {m.name}
-            </div>
-          ))}
         </div>
       )}
     </div>
@@ -1319,7 +1041,7 @@ export default function RallyApp({ workspaceName, currentUser, currentUserEmail,
             onClick={() => setProfileMenuOpen((v) => !v)}
             style={{ border: "none", background: "transparent", padding: 0, cursor: "pointer", display: "flex", alignItems: "center", gap: 4 }}
           >
-            <AvatarCircle a={currentUser} size={32} fontSize={12} />
+            <AvatarCircle avatar={currentUser} size={32} fontSize={12} />
             {!isGuest && <div style={{ fontSize: 11, color: "oklch(0.6 0.01 60)" }}>&#9662;</div>}
           </button>
           {profileMenuOpen && (
@@ -1762,7 +1484,7 @@ export default function RallyApp({ workspaceName, currentUser, currentUserEmail,
                       return (
                         <div key={m.id} style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                           <div style={{ display: "flex", gap: 10 }}>
-                            <AvatarCircle a={m.author} size={28} fontSize={10.5} />
+                            <AvatarCircle avatar={m.author} size={28} fontSize={10.5} />
                             <div style={{ display: "flex", flexDirection: "column", gap: 4, minWidth: 0, flex: 1 }}>
                               <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
                                 <div style={{ fontSize: 13, fontWeight: 700 }}>{m.author.name}</div>
@@ -1789,7 +1511,7 @@ export default function RallyApp({ workspaceName, currentUser, currentUserEmail,
                               ) : (
                                 replies.map((r) => (
                                   <div key={r.id} style={{ display: "flex", gap: 8 }}>
-                                    <AvatarCircle a={r.author} size={22} fontSize={9} />
+                                    <AvatarCircle avatar={r.author} size={22} fontSize={9} />
                                     <div style={{ display: "flex", flexDirection: "column", gap: 2, minWidth: 0 }}>
                                       <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
                                         <div style={{ fontSize: 12.5, fontWeight: 700 }}>{r.author.name}</div>
@@ -1852,7 +1574,7 @@ export default function RallyApp({ workspaceName, currentUser, currentUserEmail,
                 <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
                   {manageSpace.members.map((m) => (
                     <div key={m.id} style={{ display: "flex", alignItems: "center", gap: 6, background: "oklch(0.96 0.006 60)", borderRadius: 999, padding: "3px 6px 3px 3px" }}>
-                      <AvatarCircle a={m} size={20} fontSize={9} />
+                      <AvatarCircle avatar={m} size={20} fontSize={9} />
                       <div style={{ fontSize: 12, fontWeight: 600 }}>{m.name}</div>
                       {m.id !== currentUser.id && (
                         <button
@@ -2040,7 +1762,7 @@ export default function RallyApp({ workspaceName, currentUser, currentUserEmail,
                   <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                     {allMembers.map((m) => (
                       <div key={m.id} style={{ display: "flex", alignItems: "center", gap: 10, border: "1px solid oklch(0.9 0.006 60)", borderRadius: 10, padding: "8px 12px" }}>
-                        <AvatarCircle a={m} size={24} fontSize={10} />
+                        <AvatarCircle avatar={m} size={24} fontSize={10} />
                         <div style={{ flex: 1, minWidth: 0, fontSize: 13, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{m.name}</div>
                         {m.role === "OWNER" || m.id === currentUser.id ? (
                           <span style={{ fontSize: 11.5, fontWeight: 700, color: "oklch(0.5 0.01 60)", textTransform: "capitalize" }}>{m.role.toLowerCase()}</span>
@@ -2310,8 +2032,7 @@ export default function RallyApp({ workspaceName, currentUser, currentUserEmail,
       {!isGuest && drawerOpen && (
         <div style={{ position: "fixed", inset: 0, background: "oklch(0 0 0 / 0.35)", zIndex: 60, display: "flex" }}>
           <div style={{ width: 280, height: "100%", background: "#fff", padding: "16px 12px", display: "flex", flexDirection: "column", gap: 18, overflowY: "auto" }}>
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-              <Image src="/logo-black.png" alt="Rally" width={2029} height={775} style={{ height: "auto", width: 80, maxWidth: 2029, maxHeight: 775 }} />
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end" }}>
               <button onClick={toggleDrawer} style={{ border: "none", background: "oklch(0.95 0.006 60)", width: 30, height: 30, borderRadius: 8, fontSize: 16, cursor: "pointer" }}>
                 &times;
               </button>
@@ -2358,86 +2079,13 @@ export default function RallyApp({ workspaceName, currentUser, currentUserEmail,
               <TaskPanelSkeleton />
             ) : (
               <>
-                <div style={{ display: "flex", alignItems: "flex-start", gap: 12 }}>
-                  <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 4 }}>
-                    {!isGuest && taskEditMode ? (
-                      <input
-                        key={selectedTask.id}
-                        defaultValue={selectedTask.title}
-                        onBlur={(e) => handleSaveTitle(selectedTask.id, e.target.value)}
-                        disabled={savingField === "title"}
-                        style={{ width: "100%", boxSizing: "border-box", fontSize: 17, fontWeight: 700, lineHeight: 1.35, border: "1px solid oklch(0.6 0.14 240)", borderRadius: 8, padding: "4px 6px", fontFamily: "inherit" }}
-                      />
-                    ) : (
-                      <div style={{ fontSize: 17, fontWeight: 700, lineHeight: 1.35 }}>{selectedTask.title}</div>
-                    )}
-                    <div style={{ fontSize: 11.5, color: MUTED_FG }}>Opened by {selectedTask.createdBy.name}</div>
-                  </div>
-                  {!isGuest && (
-                    <button
-                      onClick={() => setTaskEditMode((v) => !v)}
-                      title={taskEditMode ? "Done editing" : "Edit task"}
-                      style={{ border: "none", background: taskEditMode ? "oklch(0.68 0.16 35)" : "oklch(0.95 0.006 60)", color: taskEditMode ? "#fff" : "inherit", padding: "0 10px", height: 30, borderRadius: 8, fontSize: 11.5, fontWeight: 700, cursor: "pointer", flex: "none" }}
-                    >
-                      {taskEditMode ? "Done" : "Edit"}
-                    </button>
-                  )}
-                  <CopyButton text={`${typeof window !== "undefined" ? window.location.origin + window.location.pathname : ""}?task=${selectedTask.id}`} label="Copy link" />
-                  {!isGuest && taskEditMode && (
-                    <button
-                      onClick={() => handleDeleteTask(selectedTask.id)}
-                      title="Delete task"
-                      style={{ border: "none", background: "oklch(0.95 0.006 60)", padding: "0 10px", height: 30, borderRadius: 8, fontSize: 11.5, fontWeight: 700, cursor: "pointer", flex: "none", color: "oklch(0.55 0.18 25)" }}
-                    >
-                      Delete
-                    </button>
-                  )}
-                  <button onClick={closeTask} style={{ border: "none", background: "oklch(0.95 0.006 60)", width: 30, height: 30, borderRadius: 8, fontSize: 16, cursor: "pointer", flex: "none" }}>
-                    &times;
-                  </button>
-                </div>
+                <TaskDetailHeader task={selectedTask} isGuest={isGuest} editMode={taskEditMode} savingTitle={savingField === "title"} onClose={closeTask} onDelete={() => handleDeleteTask(selectedTask.id)} onSaveTitle={(title) => handleSaveTitle(selectedTask.id, title)} onToggleEdit={() => setTaskEditMode((value) => !value)} />
                 {taskPanelError && (
                   <div style={{ fontSize: 12.5, fontWeight: 600, color: "oklch(0.5 0.18 25)", background: "oklch(0.95 0.05 25)", borderRadius: 8, padding: "8px 12px" }}>
                     {taskPanelError}
                   </div>
                 )}
-                <div>
-                  <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.55 0.01 60)", textTransform: "uppercase", letterSpacing: "0.03em", marginBottom: 6 }}>Assignees</div>
-                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: !isGuest && taskEditMode ? 6 : 0 }}>
-                    {selectedTask.assignees.map((a) => (
-                      <div key={a.id} style={{ display: "flex", alignItems: "center", gap: 6, background: "oklch(0.96 0.006 60)", borderRadius: 999, padding: "3px 6px 3px 3px" }}>
-                        <AvatarCircle a={a} size={20} fontSize={9} />
-                        <span style={{ fontSize: 12, fontWeight: 600 }}>{a.name}</span>
-                        {!isGuest && taskEditMode && (
-                          <button
-                            onClick={() => handleRemoveAssignee(selectedTask.id, a.id)}
-                            disabled={savingField === "assignee"}
-                            style={{ border: "none", background: "transparent", cursor: "pointer", fontSize: 12, color: "oklch(0.5 0.01 60)", padding: "0 2px" }}
-                          >
-                            &times;
-                          </button>
-                        )}
-                      </div>
-                    ))}
-                    {selectedTask.assignees.length === 0 && <span style={{ fontSize: 12.5, color: MUTED_FG }}>Unassigned</span>}
-                  </div>
-                  {!isGuest && taskEditMode && (() => {
-                    const addable = spaceMembers.filter((m) => !selectedTask.assignees.some((a) => a.id === m.id));
-                    return addable.length > 0 ? (
-                      <select
-                        value=""
-                        onChange={(e) => e.target.value && handleAddAssignee(selectedTask.id, e.target.value)}
-                        disabled={savingField === "assignee"}
-                        style={{ fontSize: 12.5, fontWeight: 700, padding: "4px 8px", borderRadius: 8, border: "1px solid oklch(0.88 0.006 60)", background: "#fff", fontFamily: "inherit", cursor: "pointer" }}
-                      >
-                        <option value="">+ Add assignee</option>
-                        {addable.map((m) => (
-                          <option key={m.id} value={m.id}>{m.name}</option>
-                        ))}
-                      </select>
-                    ) : null;
-                  })()}
-                </div>
+                <TaskAssignees task={selectedTask} members={spaceMembers} isGuest={isGuest} editMode={taskEditMode} saving={savingField === "assignee"} onAdd={(userId) => handleAddAssignee(selectedTask.id, userId)} onRemove={(userId) => handleRemoveAssignee(selectedTask.id, userId)} />
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, padding: 14, background: "oklch(0.98 0.004 60)", borderRadius: 10 }}>
                   <div>
                     <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.55 0.01 60)", textTransform: "uppercase", letterSpacing: "0.03em", marginBottom: 4 }}>Priority</div>
@@ -2489,260 +2137,59 @@ export default function RallyApp({ workspaceName, currentUser, currentUserEmail,
                     )}
                   </div>
                 </div>
-                <div>
-                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
-                    <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.55 0.01 60)", textTransform: "uppercase", letterSpacing: "0.03em" }}>Description</div>
-                    {!isGuest && taskEditMode && editingDescTaskId !== selectedTask.id && (
-                      <button
-                        onClick={() => setEditingDescTaskId(selectedTask.id)}
-                        style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.68 0.16 35)", background: "none", border: "none", cursor: "pointer", padding: 0 }}
-                      >
-                        Edit
-                      </button>
-                    )}
-                  </div>
-                  {isGuest || !taskEditMode || editingDescTaskId !== selectedTask.id ? (
-                    selectedTask.desc ? (
-                      <Markdown text={selectedTask.desc} />
-                    ) : (
-                      <div style={{ fontSize: 13.5, color: MUTED_FG }}>No description.</div>
-                    )
-                  ) : (
-                    <textarea
-                      key={selectedTask.id}
-                      defaultValue={selectedTask.desc}
-                      placeholder="Add a description… (Markdown supported)"
-                      onBlur={(e) => {
-                        handleDescriptionBlur(selectedTask.id, e.target.value);
-                        setEditingDescTaskId(null);
-                      }}
-                      disabled={savingField === "desc"}
-                      autoFocus
-                      rows={5}
-                      style={{ width: "100%", fontSize: 13.5, lineHeight: 1.6, color: "oklch(0.3 0.01 60)", fontFamily: "inherit", border: "1px solid oklch(0.88 0.006 60)", borderRadius: 8, padding: "8px 10px", resize: "vertical" }}
-                    />
-                  )}
-                </div>
-                <div>
-                  {(() => {
-                    const done = selectedTask.checklist.filter((c) => c.done).length;
-                    const total = selectedTask.checklist.length;
-                    return (
-                      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 8 }}>
-                        <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.55 0.01 60)", textTransform: "uppercase", letterSpacing: "0.03em" }}>Checklist</div>
-                        {total > 0 && <div style={{ fontSize: 11.5, color: "oklch(0.55 0.01 60)" }}>{done}/{total}</div>}
-                      </div>
-                    );
-                  })()}
-                  {selectedTask.checklist.length > 0 && (
-                    <div style={{ height: 6, borderRadius: 999, background: "oklch(0.92 0.006 60)", overflow: "hidden", marginBottom: 8 }}>
-                      <div
-                        style={{
-                          height: "100%",
-                          background: "oklch(0.68 0.16 35)",
-                          width: `${Math.round((selectedTask.checklist.filter((c) => c.done).length / selectedTask.checklist.length) * 100)}%`,
-                        }}
-                      />
-                    </div>
-                  )}
-                  <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: isGuest ? 0 : 6 }}>
-                    {selectedTask.checklist.map((item) => (
-                      <div key={item.id} style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                        <input
-                          type="checkbox"
-                          checked={item.done}
-                          disabled={isGuest}
-                          onChange={(e) => handleToggleChecklistItem(item.id, e.target.checked)}
-                          style={{ cursor: isGuest ? "default" : "pointer" }}
-                        />
-                        <span style={{ flex: 1, fontSize: 12.5, color: item.done ? MUTED_FG : "oklch(0.3 0.01 60)", textDecoration: item.done ? "line-through" : "none" }}>
-                          {item.text}
-                        </span>
-                        {!isGuest && (
-                          <button onClick={() => handleDeleteChecklistItem(item.id)} style={{ border: "none", background: "none", cursor: "pointer", color: MUTED_FG, fontSize: 13, flex: "none" }}>
-                            &times;
-                          </button>
-                        )}
-                      </div>
-                    ))}
-                    {selectedTask.checklist.length === 0 && <div style={{ fontSize: 12.5, color: MUTED_FG }}>No checklist items.</div>}
-                  </div>
-                  {!isGuest && (
-                    <input
-                      value={newChecklistText}
-                      onChange={(e) => setNewChecklistText(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") handleAddChecklistItem(selectedTask.id);
-                      }}
-                      placeholder="+ Add checklist item"
-                      style={{ width: "100%", fontSize: 12.5, padding: "6px 8px", borderRadius: 8, border: "1px solid oklch(0.88 0.006 60)", fontFamily: "inherit" }}
-                    />
-                  )}
-                </div>
-                {(() => {
-                  const currentList = listById.get(selectedTask.listId);
-                  if (!currentList || currentList.customFields.length === 0) return null;
-                  return (
-                    <div>
-                      <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.55 0.01 60)", textTransform: "uppercase", letterSpacing: "0.03em", marginBottom: 8 }}>Custom fields</div>
-                      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                        {currentList.customFields.map((field) => {
-                          const value = selectedTask.customFieldValues.find((v) => v.fieldId === field.id)?.value ?? "";
-                          return (
-                            <div key={field.id} style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                              <div style={{ width: 100, flex: "none", fontSize: 12.5, fontWeight: 600, color: "oklch(0.4 0.01 60)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                                {field.name}
-                              </div>
-                              {isGuest || !taskEditMode ? (
-                                <div style={{ flex: 1, fontSize: 12.5 }}>{value || <span style={{ color: MUTED_FG }}>—</span>}</div>
-                              ) : field.type === "DROPDOWN" ? (
-                                <select
-                                  value={value}
-                                  onChange={(e) => handleSetCustomFieldValue(selectedTask.id, field.id, e.target.value)}
-                                  style={{ flex: 1, fontSize: 12.5, padding: "4px 8px", borderRadius: 8, border: "1px solid oklch(0.88 0.006 60)", background: "#fff", fontFamily: "inherit", cursor: "pointer" }}
-                                >
-                                  <option value="">—</option>
-                                  {field.options.map((o) => (
-                                    <option key={o} value={o}>{o}</option>
-                                  ))}
-                                </select>
-                              ) : (
-                                <CustomFieldValueEditor
-                                  key={`${selectedTask.id}:${field.id}`}
-                                  type={field.type}
-                                  value={value}
-                                  onSave={(v) => handleSetCustomFieldValue(selectedTask.id, field.id, v)}
-                                />
-                              )}
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  );
-                })()}
-                {(() => {
-                  const dependencyCandidates = tasksInSpace.filter(
-                    (t) => t.id !== selectedTask.id && !selectedTask.dependsOn.some((d) => d.id === t.id)
-                  );
-                  return (
-                    <div>
-                      <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.55 0.01 60)", textTransform: "uppercase", letterSpacing: "0.03em", marginBottom: 8 }}>Blocked by</div>
-                      <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: 6 }}>
-                        {selectedTask.dependsOn.map((d) => (
-                          <div key={d.id} style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                            <div style={{ width: 7, height: 7, borderRadius: "50%", background: STATUSES.find((s) => s.key === d.status)!.color, flex: "none" }} />
-                            <button onClick={() => openTask(d.id)} style={{ flex: 1, minWidth: 0, textAlign: "left", border: "none", background: "none", cursor: "pointer", padding: 0, fontSize: 12.5, fontWeight: 600, color: "oklch(0.3 0.01 60)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                              {d.title}
-                            </button>
-                            {!isGuest && taskEditMode && (
-                              <button onClick={() => handleRemoveDependency(selectedTask.id, d.id)} style={{ border: "none", background: "none", cursor: "pointer", color: MUTED_FG, fontSize: 13, flex: "none" }}>
-                                &times;
-                              </button>
-                            )}
-                          </div>
-                        ))}
-                        {selectedTask.dependsOn.length === 0 && <div style={{ fontSize: 12.5, color: MUTED_FG }}>Not blocked by anything.</div>}
-                      </div>
-                      {!isGuest && taskEditMode && dependencyCandidates.length > 0 && (
-                        <select
-                          value=""
-                          onChange={(e) => e.target.value && handleAddDependency(selectedTask.id, e.target.value)}
-                          style={{ fontSize: 12.5, fontWeight: 700, padding: "4px 8px", borderRadius: 8, border: "1px solid oklch(0.88 0.006 60)", background: "#fff", fontFamily: "inherit", cursor: "pointer" }}
-                        >
-                          <option value="">+ Add blocking task</option>
-                          {dependencyCandidates.map((t) => (
-                            <option key={t.id} value={t.id}>{t.title}</option>
-                          ))}
-                        </select>
-                      )}
-                      {selectedTask.dependents.length > 0 && (
-                        <>
-                          <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.55 0.01 60)", textTransform: "uppercase", letterSpacing: "0.03em", margin: "12px 0 8px" }}>Blocks</div>
-                          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                            {selectedTask.dependents.map((d) => (
-                              <div key={d.id} style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                                <div style={{ width: 7, height: 7, borderRadius: "50%", background: STATUSES.find((s) => s.key === d.status)!.color, flex: "none" }} />
-                                <button onClick={() => openTask(d.id)} style={{ flex: 1, minWidth: 0, textAlign: "left", border: "none", background: "none", cursor: "pointer", padding: 0, fontSize: 12.5, fontWeight: 600, color: "oklch(0.3 0.01 60)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                                  {d.title}
-                                </button>
-                              </div>
-                            ))}
-                          </div>
-                        </>
-                      )}
-                    </div>
-                  );
-                })()}
-                <div>
-                  <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.55 0.01 60)", textTransform: "uppercase", letterSpacing: "0.03em", marginBottom: 8 }}>Attachments ({selectedTask.attachments.length})</div>
-                  <div style={{ display: "flex", flexDirection: "column", gap: 6, marginBottom: isGuest ? 0 : 8 }}>
-                    {selectedTask.attachments.map((a) => (
-                      <div key={a.id} style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, border: "1px solid oklch(0.9 0.006 60)", borderRadius: 8, padding: "6px 8px" }}>
-                        <a
-                          href={`/api/attachments/${a.id}`}
-                          style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", fontWeight: 600, color: "oklch(0.3 0.01 60)" }}
-                        >
-                          {a.filename}
-                        </a>
-                        <span style={{ color: MUTED_FG, fontSize: 11, flex: "none" }}>{formatBytes(a.size)}</span>
-                        {!isGuest && (
-                          <button onClick={() => handleDeleteAttachment(a.id)} style={{ border: "none", background: "none", cursor: "pointer", color: "oklch(0.55 0.18 25)", fontSize: 13, flex: "none" }}>
-                            &times;
-                          </button>
-                        )}
-                      </div>
-                    ))}
-                    {selectedTask.attachments.length === 0 && <div style={{ fontSize: 12.5, color: MUTED_FG }}>No attachments.</div>}
-                  </div>
-                  {!isGuest && (
-                    <input
-                      type="file"
-                      onChange={(e) => {
-                        handleUploadAttachment(selectedTask.id, e.target.files?.[0] ?? null);
-                        e.target.value = "";
-                      }}
-                      disabled={uploadingAttachment}
-                      style={{ fontSize: 12 }}
-                    />
-                  )}
-                </div>
-                <div>
-                  <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.55 0.01 60)", textTransform: "uppercase", letterSpacing: "0.03em", marginBottom: 8 }}>Comments ({selectedTask.comments.length})</div>
-                  <div style={{ display: "flex", flexDirection: "column", gap: 12, marginBottom: 10 }}>
-                    {selectedTask.comments.map((c) => (
-                      <div key={c.id} style={{ display: "flex", gap: 8 }}>
-                        <AvatarCircle a={c.author} size={24} fontSize={10} />
-                        <div style={{ display: "flex", flexDirection: "column", gap: 2, minWidth: 0, flex: 1 }}>
-                          <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
-                            <span style={{ fontSize: 12.5, fontWeight: 700 }}>{c.author.name}</span>
-                            <span style={{ fontSize: 11, color: MUTED_FG }}>{c.time}</span>
-                          </div>
-                          <Markdown text={c.body} />
-                        </div>
-                      </div>
-                    ))}
-                    {selectedTask.comments.length === 0 && <div style={{ fontSize: 12.5, color: MUTED_FG }}>No comments yet.</div>}
-                  </div>
-                  <div style={{ display: "flex", gap: 8 }}>
-                    <MentionComposer
-                      value={commentBody}
-                      onChange={setCommentBody}
-                      candidates={spaceMembers}
-                      onEnter={handlePostComment}
-                      placeholder="Add a comment… (@ to mention, Markdown supported)"
-                      disabled={postingComment}
-                      inputStyle={{ width: "100%", border: "1px solid oklch(0.88 0.006 60)", borderRadius: 8, padding: "9px 12px", fontSize: 13, fontFamily: "inherit" }}
-                    />
-                    <button
-                      onClick={handlePostComment}
-                      disabled={postingComment || !commentBody.trim()}
-                      style={{ border: "none", background: "oklch(0.68 0.16 35)", color: "#fff", borderRadius: 8, padding: "0 14px", fontSize: 13, fontWeight: 700, cursor: "pointer", opacity: postingComment || !commentBody.trim() ? 0.6 : 1 }}
-                    >
-                      Post
-                    </button>
-                  </div>
-                </div>
+                <TaskDescription
+                  task={selectedTask}
+                  isGuest={isGuest}
+                  editMode={taskEditMode}
+                  editing={editingDescTaskId === selectedTask.id}
+                  saving={savingField === "desc"}
+                  onStartEdit={() => setEditingDescTaskId(selectedTask.id)}
+                  onSave={(description) => {
+                    handleDescriptionBlur(selectedTask.id, description);
+                    setEditingDescTaskId(null);
+                  }}
+                />
+                <TaskChecklist
+                  checklist={selectedTask.checklist}
+                  isGuest={isGuest}
+                  newItemText={newChecklistText}
+                  onChangeNewItemText={setNewChecklistText}
+                  onAdd={() => handleAddChecklistItem(selectedTask.id)}
+                  onToggle={handleToggleChecklistItem}
+                  onDelete={handleDeleteChecklistItem}
+                />
+                <TaskCustomFields
+                  fields={listById.get(selectedTask.listId)?.customFields ?? []}
+                  values={selectedTask.customFieldValues}
+                  isGuest={isGuest}
+                  editMode={taskEditMode}
+                  onSetValue={(fieldId, value) => handleSetCustomFieldValue(selectedTask.id, fieldId, value)}
+                />
+                <TaskDependencies
+                  dependsOn={selectedTask.dependsOn}
+                  dependents={selectedTask.dependents}
+                  candidates={tasksInSpace.filter((t) => t.id !== selectedTask.id && !selectedTask.dependsOn.some((d) => d.id === t.id))}
+                  isGuest={isGuest}
+                  editMode={taskEditMode}
+                  onOpenTask={openTask}
+                  onAdd={(dependsOnId) => handleAddDependency(selectedTask.id, dependsOnId)}
+                  onRemove={(dependsOnId) => handleRemoveDependency(selectedTask.id, dependsOnId)}
+                />
+                <TaskAttachments
+                  attachments={selectedTask.attachments}
+                  isGuest={isGuest}
+                  uploading={uploadingAttachment}
+                  onUpload={(file) => handleUploadAttachment(selectedTask.id, file)}
+                  onDelete={handleDeleteAttachment}
+                />
+                <TaskComments
+                  comments={selectedTask.comments}
+                  candidates={spaceMembers}
+                  value={commentBody}
+                  onChangeValue={setCommentBody}
+                  posting={postingComment}
+                  onPost={handlePostComment}
+                />
               </>
             )}
           </div>
