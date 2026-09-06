@@ -33,3 +33,7 @@ Rationale: auth and the core hierarchy come first because everything else depend
 - Chat works: channels, DMs, threads, task links unfurl
 - Notifications fire over email, and over Slack if the workspace enabled it
 - The app is usable on a phone browser without horizontal scrolling or broken layout
+
+## Production cutover
+
+Phase 1 being feature-complete does not make it ready to deploy. Complete the [Production readiness](04-production-readiness.md) checklist before treating a deployment as production.

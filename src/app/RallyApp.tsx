@@ -1,35 +1,47 @@
 "use client";
 
-import { useState, useEffect, type ChangeEvent, type CSSProperties, type ReactNode } from "react";
+import { useState, useEffect, useMemo, type ChangeEvent, type CSSProperties, type ReactNode } from "react";
 import Image from "next/image";
 import { signOut } from "next-auth/react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
+  addChecklistItem,
   addTaskAssignee,
   addTaskDependency,
   assignToSpace,
+  createCustomField,
   createInvite,
   createList,
   createSpace,
   createTask,
   deleteAttachment,
+  deleteChecklistItem,
+  deleteCustomField,
   deleteTask,
   getOrCreateDirectChannel,
   markAllNotificationsRead,
+  markChannelRead,
   markNotificationRead,
+  moveTaskToList,
   postComment,
   postMessage,
   removeFromSpace,
   removeTaskAssignee,
   removeTaskDependency,
   revokeInvite,
+  setCustomFieldValue,
   setMemberRole,
+  toggleChecklistItem,
+  updateNotificationPrefs,
+  updatePassword,
+  updateProfileName,
   updateSlackWebhook,
   updateTaskDescription,
   updateTaskDueDate,
   updateTaskPriority,
   updateTaskStatus,
+  updateTaskTitle,
   uploadAttachment,
 } from "./actions";
 import { activeMentionQuery, mentionToken, parseMentions } from "@/lib/mentions";
@@ -45,8 +57,13 @@ export type UiComment = { id: string; author: UiAvatar; body: string; time: stri
 export type UiAttachment = { id: string; filename: string; mimeType: string; size: number; uploadedBy: UiAvatar; time: string };
 export type UiTaskRef = { id: string; title: string; status: StatusKey };
 
+export type UiChecklistItem = { id: string; text: string; done: boolean };
+export type UiCustomField = { id: string; name: string; type: "TEXT" | "NUMBER" | "DATE" | "DROPDOWN"; options: string[] };
+export type UiCustomFieldValue = { fieldId: string; value: string };
+
 export type UiTask = {
   id: string;
+  listId: string;
   title: string;
   desc: string;
   status: StatusKey;
@@ -54,17 +71,19 @@ export type UiTask = {
   due: string;
   dueDate: string | null;
   assignees: UiAvatar[];
-  checklist: { done: number; total: number } | null;
+  createdBy: UiAvatar;
+  checklist: UiChecklistItem[];
+  customFieldValues: UiCustomFieldValue[];
   comments: UiComment[];
   attachments: UiAttachment[];
   dependsOn: UiTaskRef[];
   dependents: UiTaskRef[];
 };
 
-export type UiList = { id: string; name: string; isSprint: boolean; sprintStart: string | null; sprintEnd: string | null; tasks: UiTask[] };
+export type UiList = { id: string; name: string; isSprint: boolean; sprintStart: string | null; sprintEnd: string | null; tasks: UiTask[]; customFields: UiCustomField[] };
 export type UiSpace = { id: string; name: string; hue: number; members: UiAvatar[]; lists: UiList[] };
 export type UiMessage = { id: string; author: UiAvatar; text: string; time: string; parentMessageId: string | null };
-export type UiChannel = { id: string; name: string; isDirect: boolean; members: UiAvatar[]; messages: UiMessage[] };
+export type UiChannel = { id: string; name: string; isDirect: boolean; unread: number; members: UiAvatar[]; messages: UiMessage[] };
 export type UiInvite = { id: string; email: string; role: string; scope: string | null; url: string };
 export type UiMember = UiAvatar & { role: RoleKey };
 export type UiNotification = { id: string; text: string; time: string; read: boolean; taskId: string | null };
@@ -72,6 +91,7 @@ export type UiNotification = { id: string; text: string; time: string; read: boo
 export type RallyAppProps = {
   workspaceName: string;
   currentUser: UiAvatar;
+  currentUserEmail: string;
   isGuestRole: boolean;
   role: RoleKey;
   spaces: UiSpace[];
@@ -82,7 +102,15 @@ export type RallyAppProps = {
   pendingInvites: UiInvite[];
   notifications: UiNotification[];
   slackWebhookUrl: string | null;
+  notificationPrefs: Record<string, boolean> | null;
 };
+
+const NOTIF_PREF_DEFS: { key: string; label: string; group: string }[] = [
+  { key: "taskAssigned", label: "Assigned to a task", group: "Tasks" },
+  { key: "taskDue", label: "Task due soon", group: "Tasks" },
+  { key: "comments", label: "Comments & mentions on tasks", group: "Tasks" },
+  { key: "chatMentions", label: "Mentions in chat", group: "Chat" },
+];
 
 const STATUSES: { key: StatusKey; label: string; color: string }[] = [
   { key: "todo", label: "To Do", color: "oklch(0.6 0.01 60)" },
@@ -139,6 +167,37 @@ function Pill({ bg, fg, children }: { bg: string; fg: string; children: ReactNod
   );
 }
 
+/** A "Copy link" button that swaps to a "Copied!" confirmation state for 1.5s after a click. */
+function CopyButton({ text, label = "Copy link", style }: { text: string; label?: string; style?: CSSProperties }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <button
+      onClick={async () => {
+        await navigator.clipboard.writeText(text);
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1500);
+      }}
+      style={{
+        border: "none",
+        background: "oklch(0.95 0.006 60)",
+        color: "inherit",
+        padding: "0 10px",
+        height: 30,
+        borderRadius: 8,
+        fontSize: 11.5,
+        fontWeight: 700,
+        cursor: "pointer",
+        flex: "none",
+        transition: "background 0.15s, color 0.15s",
+        ...style,
+        ...(copied ? { background: "oklch(0.6 0.13 150)", color: "#fff", border: "none" } : {}),
+      }}
+    >
+      {copied ? "Copied!" : label}
+    </button>
+  );
+}
+
 function Skel({ w, h, r = 6 }: { w: string | number; h: number; r?: number }) {
   return <div className="rl-skel" style={{ width: w, height: h, borderRadius: r, flex: "none" }} />;
 }
@@ -174,10 +233,66 @@ function Markdown({ text }: { text: string }) {
   );
 }
 
+function isOverdue(task: { dueDate: string | null; status: StatusKey }): boolean {
+  if (!task.dueDate || task.status === "done") return false;
+  return new Date(task.dueDate) < new Date(new Date().toDateString());
+}
+
 function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   return `${(n / 1024 / 1024).toFixed(1)} MB`;
+}
+
+/** Clickable task preview used to unfurl a pasted task link in chat, and to give a task-related notification a quick-open target. */
+function TaskCard({ task, onOpen }: { task: { title: string; status: StatusKey }; onOpen: () => void }) {
+  const statusInfo = STATUSES.find((s) => s.key === task.status) ?? STATUSES[0];
+  return (
+    <button
+      onClick={onOpen}
+      style={{
+        display: "flex",
+        flexDirection: "column",
+        gap: 4,
+        textAlign: "left",
+        border: "1px solid oklch(0.88 0.006 60)",
+        borderRadius: 10,
+        padding: "10px 12px",
+        background: "oklch(0.985 0.004 60)",
+        cursor: "pointer",
+        width: "100%",
+        maxWidth: 320,
+        fontFamily: "inherit",
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+        <div style={{ width: 7, height: 7, borderRadius: "50%", background: statusInfo.color, flex: "none" }} />
+        <span style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.5 0.01 60)" }}>{statusInfo.label}</span>
+      </div>
+      <div style={{ fontSize: 13.5, fontWeight: 700, color: "oklch(0.22 0.01 60)" }}>{task.title}</div>
+    </button>
+  );
+}
+
+const TASK_LINK_RE = /\?task=([a-zA-Z0-9]+)/;
+
+/** Renders chat message text, unfurling a pasted task link (?task=<id>) into a TaskCard instead of a raw URL. */
+function ChatMessageBody({ text, findTask, onOpenTask }: { text: string; findTask: (id: string) => { title: string; status: StatusKey } | undefined; onOpenTask: (id: string) => void }) {
+  const match = text.match(TASK_LINK_RE);
+  const task = match ? findTask(match[1]) : undefined;
+  if (!match || !task) return <Markdown text={text} />;
+
+  const remaining = text
+    .split(/\s+/)
+    .filter((word) => !word.includes(match[0]))
+    .join(" ");
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+      {remaining && <Markdown text={remaining} />}
+      <TaskCard task={task} onOpen={() => onOpenTask(match[1])} />
+    </div>
+  );
 }
 
 /** Overlapping avatar stack for multi-assignee display; shows a dashed placeholder when unassigned. */
@@ -215,6 +330,43 @@ function AvatarStack({ avatars, size, fontSize }: { avatars: UiAvatar[]; size: n
         >
           +{extra}
         </div>
+      )}
+    </div>
+  );
+}
+
+/** Text/number/date custom-field value editor with an explicit Save button (only enabled once the draft differs from the saved value). */
+function CustomFieldValueEditor({ type, value, onSave }: { type: "TEXT" | "NUMBER" | "DATE"; value: string; onSave: (v: string) => Promise<void> }) {
+  const [draft, setDraft] = useState(value);
+  const [saving, setSaving] = useState(false);
+  const dirty = draft !== value;
+
+  async function save() {
+    setSaving(true);
+    try {
+      await onSave(draft);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div style={{ display: "flex", flex: 1, gap: 6 }}>
+      <input
+        type={type === "NUMBER" ? "number" : type === "DATE" ? "date" : "text"}
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onKeyDown={(e) => e.key === "Enter" && dirty && save()}
+        style={{ flex: 1, fontSize: 12.5, padding: "4px 8px", borderRadius: 8, border: "1px solid oklch(0.88 0.006 60)", fontFamily: "inherit" }}
+      />
+      {dirty && (
+        <button
+          onClick={save}
+          disabled={saving}
+          style={{ flex: "none", fontSize: 11.5, fontWeight: 700, padding: "0 10px", borderRadius: 8, border: "none", background: "oklch(0.68 0.16 35)", color: "#fff", cursor: "pointer", opacity: saving ? 0.6 : 1 }}
+        >
+          Save
+        </button>
       )}
     </div>
   );
@@ -374,22 +526,6 @@ function ChatSkeleton() {
   );
 }
 
-function NotificationsSkeleton() {
-  return (
-    <div style={{ flex: 1, overflow: "hidden", padding: 20, display: "flex", flexDirection: "column", gap: 8, maxWidth: 640 }}>
-      {[0, 1, 2, 3].map((i) => (
-        <div key={i} style={{ display: "flex", alignItems: "flex-start", gap: 12, padding: "14px 12px" }}>
-          <Skel w={8} h={8} r={999} />
-          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-            <Skel w={280} h={13} />
-            <Skel w={70} h={11} />
-          </div>
-        </div>
-      ))}
-    </div>
-  );
-}
-
 function TaskPanelSkeleton() {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
@@ -429,15 +565,16 @@ function AppSkeleton() {
 
 /* ---------- app ---------- */
 
-export default function RallyApp({ currentUser, isGuestRole, role, spaces, sharedLists, members, allMembers, channels, pendingInvites, notifications, slackWebhookUrl }: RallyAppProps) {
+export default function RallyApp({ workspaceName, currentUser, currentUserEmail, isGuestRole, role, spaces, sharedLists, members, allMembers, channels, pendingInvites, notifications, slackWebhookUrl, notificationPrefs }: RallyAppProps) {
   const bootLoading = useDelayedLoading("boot", 500);
 
   const [activeSpaceId, setActiveSpaceId] = useState<string>(spaces[0]?.id ?? "");
-  const [activeContext, setActiveContext] = useState<"tasks" | "chat" | "notifications" | "manage">("tasks");
+  const [activeContext, setActiveContext] = useState<"tasks" | "chat" | "manage" | "settings">("tasks");
   const [activeView, setActiveView] = useState<"board" | "list" | "sprint">("board");
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+  const [taskEditMode, setTaskEditMode] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
-  const [mobileChatShowList, setMobileChatShowList] = useState(true);
+  const [chatSidebarExpanded, setChatSidebarExpanded] = useState(false);
   const [activeChannel, setActiveChannel] = useState(channels[0]?.id ?? "");
   const [newTaskTitle, setNewTaskTitle] = useState("");
   const [addingTask, setAddingTask] = useState(false);
@@ -445,9 +582,16 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
   const [postingComment, setPostingComment] = useState(false);
   const [messageBody, setMessageBody] = useState("");
   const [postingMessage, setPostingMessage] = useState(false);
-  const [savingField, setSavingField] = useState<"status" | "priority" | "due" | "desc" | "assignee" | null>(null);
+  const [savingField, setSavingField] = useState<"status" | "priority" | "due" | "desc" | "title" | "assignee" | null>(null);
+  const [newChecklistText, setNewChecklistText] = useState("");
+  const [fieldFormListId, setFieldFormListId] = useState<string | null>(null);
+  const [newFieldName, setNewFieldName] = useState("");
+  const [newFieldType, setNewFieldType] = useState<UiCustomField["type"]>("TEXT");
+  const [newFieldOptions, setNewFieldOptions] = useState("");
+  const [creatingField, setCreatingField] = useState(false);
   const [draggedTaskId, setDraggedTaskId] = useState<string | null>(null);
   const [dragOverStatus, setDragOverStatus] = useState<StatusKey | null>(null);
+  const [dragOverColumn, setDragOverColumn] = useState<"backlog" | "sprint" | null>(null);
   const [newSpaceName, setNewSpaceName] = useState("");
   const [creatingSpace, setCreatingSpace] = useState(false);
   const [inviteEmail, setInviteEmail] = useState("");
@@ -463,6 +607,11 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
   const [newListStart, setNewListStart] = useState("");
   const [newListEnd, setNewListEnd] = useState("");
   const [creatingList, setCreatingList] = useState(false);
+  const [showSprintForm, setShowSprintForm] = useState(false);
+  const [newSprintName, setNewSprintName] = useState("");
+  const [newSprintStart, setNewSprintStart] = useState("");
+  const [newSprintEnd, setNewSprintEnd] = useState("");
+  const [creatingSprint, setCreatingSprint] = useState(false);
   const [selectedSprintId, setSelectedSprintId] = useState<string>("");
   const [savingRole, setSavingRole] = useState<string | null>(null);
   const [editingDescTaskId, setEditingDescTaskId] = useState<string | null>(null);
@@ -475,6 +624,21 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
   const [savingSlack, setSavingSlack] = useState(false);
   const [slackError, setSlackError] = useState<string | null>(null);
   const [chatError, setChatError] = useState<string | null>(null);
+  const [notifOpen, setNotifOpen] = useState(false);
+  const [profileMenuOpen, setProfileMenuOpen] = useState(false);
+  const [manageSpaceId, setManageSpaceId] = useState<string | null>(null);
+  const [settingsTab, setSettingsTab] = useState<"profile" | "notifications">("profile");
+  const [profileNameInput, setProfileNameInput] = useState(currentUser.name);
+  const [savingProfileName, setSavingProfileName] = useState(false);
+  const [passwordFormOpen, setPasswordFormOpen] = useState(false);
+  const [currentPasswordInput, setCurrentPasswordInput] = useState("");
+  const [newPasswordInput, setNewPasswordInput] = useState("");
+  const [confirmPasswordInput, setConfirmPasswordInput] = useState("");
+  const [savingPassword, setSavingPassword] = useState(false);
+  const [passwordError, setPasswordError] = useState<string | null>(null);
+  const [notifPrefs, setNotifPrefs] = useState<Record<string, boolean>>(() =>
+    Object.fromEntries(NOTIF_PREF_DEFS.map((d) => [d.key, notificationPrefs?.[d.key] !== false]))
+  );
 
   const isGuest = isGuestRole;
   const canManage = !isGuest && (role === "OWNER" || role === "ADMIN");
@@ -484,16 +648,22 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
     setActiveContext("tasks");
     setDrawerOpen(false);
   };
+  const openSpaceSettings = (id: string) => {
+    setManageSpaceId(id);
+    setActiveContext("manage");
+    setDrawerOpen(false);
+  };
   const selectContext = (key: typeof activeContext) => {
     setActiveContext(key);
     setDrawerOpen(false);
-    setMobileChatShowList(true);
+    setManageSpaceId(null);
   };
   const openTask = (id: string) => {
     setSelectedTaskId(id);
     setCommentBody("");
     setEditingDescTaskId(null);
     setTaskPanelError(null);
+    setTaskEditMode(false);
   };
   const closeTask = () => setSelectedTaskId(null);
   const toggleDrawer = () => setDrawerOpen((d) => !d);
@@ -502,20 +672,61 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
     setMessageBody("");
     setReplyingTo(null);
     setChatError(null);
-    setMobileChatShowList(false);
+    setActiveContext("chat");
+    setDrawerOpen(false);
+    markChannelRead(key);
   };
-  const backToChatList = () => setMobileChatShowList(true);
 
   const showTasks = isGuest || activeContext === "tasks";
   const showChat = !isGuest && activeContext === "chat";
-  const showNotifications = !isGuest && activeContext === "notifications";
   const showManage = canManage && activeContext === "manage";
+  const showSettings = !isGuest && activeContext === "settings";
 
   const activeSpace = spaces.find((s) => s.id === activeSpaceId) ?? spaces[0];
   const spaceMembers = activeSpace?.members ?? members;
   const allLists = spaces.flatMap((s) => s.lists.map((l) => ({ id: l.id, label: `${s.name} / ${l.name}` })));
-  const guestLists = isGuestRole ? sharedLists : [];
+  const guestLists = useMemo(() => (isGuestRole ? sharedLists : []), [isGuestRole, sharedLists]);
   const tasksInSpace = isGuest ? guestLists.flatMap((l) => l.tasks) : activeSpace?.lists.flatMap((l) => l.tasks) ?? [];
+
+  // Flat lookup across every space/list this user can see, so a task link (chat unfurl,
+  // notification card, or the ?task= deep link) can be opened regardless of which space is active.
+  const { taskById, taskSpaceById, listById } = useMemo(() => {
+    const byId = new Map<string, UiTask>();
+    const spaceById = new Map<string, string>();
+    const listMap = new Map<string, UiList>();
+    for (const s of spaces) for (const l of s.lists) {
+      listMap.set(l.id, l);
+      for (const t of l.tasks) {
+        byId.set(t.id, t);
+        spaceById.set(t.id, s.id);
+      }
+    }
+    for (const l of guestLists) {
+      listMap.set(l.id, l);
+      for (const t of l.tasks) byId.set(t.id, t);
+    }
+    return { taskById: byId, taskSpaceById: spaceById, listById: listMap };
+  }, [spaces, guestLists]);
+
+  const openTaskGlobal = (id: string) => {
+    const spaceId = taskSpaceById.get(id);
+    if (spaceId) setActiveSpaceId(spaceId);
+    setActiveContext("tasks");
+    setDrawerOpen(false);
+    openTask(id);
+  };
+
+  useEffect(() => {
+    const id = new URLSearchParams(window.location.search).get("task");
+    if (!id) return;
+    const t = setTimeout(() => {
+      openTaskGlobal(id);
+      window.history.replaceState(null, "", window.location.pathname);
+    }, 0);
+    return () => clearTimeout(t);
+    // Only ever needs to run once on mount, to consume a shared/deep-linked URL.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const sprintLists = isGuest ? [] : activeSpace?.lists.filter((l) => l.isSprint) ?? [];
   const sprintList = isGuest ? guestLists[0] : sprintLists.find((l) => l.id === selectedSprintId) ?? sprintLists[0];
   const targetList = isGuest ? guestLists[0] : activeSpace?.lists.find((l) => l.isSprint) ?? activeSpace?.lists[0];
@@ -569,6 +780,45 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
     } finally {
       setSavingField(null);
     }
+  }
+
+  async function handleAddChecklistItem(taskId: string) {
+    const text = newChecklistText.trim();
+    if (!text) return;
+    setNewChecklistText("");
+    await addChecklistItem(taskId, text);
+  }
+
+  async function handleToggleChecklistItem(itemId: string, done: boolean) {
+    await toggleChecklistItem(itemId, done);
+  }
+
+  async function handleDeleteChecklistItem(itemId: string) {
+    await deleteChecklistItem(itemId);
+  }
+
+  async function handleCreateCustomField(listId: string) {
+    const name = newFieldName.trim();
+    if (!name) return;
+    setCreatingField(true);
+    try {
+      const options = newFieldType === "DROPDOWN" ? newFieldOptions.split(",").map((o) => o.trim()).filter(Boolean) : [];
+      await createCustomField(listId, name, newFieldType, options);
+      setNewFieldName("");
+      setNewFieldOptions("");
+      setFieldFormListId(null);
+    } finally {
+      setCreatingField(false);
+    }
+  }
+
+  async function handleDeleteCustomField(fieldId: string) {
+    if (!confirm("Delete this field? Its values on every task will be removed.")) return;
+    await deleteCustomField(fieldId);
+  }
+
+  async function handleSetCustomFieldValue(taskId: string, fieldId: string, value: string) {
+    await setCustomFieldValue(taskId, fieldId, value);
   }
 
   async function handleAddDependency(taskId: string, dependsOnId: string) {
@@ -742,7 +992,9 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
   }
 
   async function handleOpenNotification(n: UiNotification) {
+    setNotifOpen(false);
     if (!n.read) await markNotificationRead(n.id);
+    if (n.taskId) openTaskGlobal(n.taskId);
   }
 
   async function handleSetMemberRole(userId: string, role: "ADMIN" | "MEMBER") {
@@ -754,9 +1006,74 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
     }
   }
 
+  async function handleCreateSprint() {
+    const name = newSprintName.trim();
+    if (!name || !activeSpace || creatingSprint) return;
+    setCreatingSprint(true);
+    try {
+      await createList(activeSpace.id, name, true, newSprintStart || undefined, newSprintEnd || undefined);
+      setNewSprintName("");
+      setNewSprintStart("");
+      setNewSprintEnd("");
+      setShowSprintForm(false);
+    } finally {
+      setCreatingSprint(false);
+    }
+  }
+
+  async function handleMoveTask(taskId: string, listId: string) {
+    await moveTaskToList(taskId, listId);
+  }
+
+  async function handleSaveTitle(taskId: string, title: string) {
+    if (!title.trim()) return;
+    setSavingField("title");
+    try {
+      await updateTaskTitle(taskId, title);
+    } finally {
+      setSavingField(null);
+    }
+  }
+
+  async function handleSaveProfileName() {
+    const name = profileNameInput.trim();
+    if (!name || savingProfileName) return;
+    setSavingProfileName(true);
+    try {
+      await updateProfileName(name);
+    } finally {
+      setSavingProfileName(false);
+    }
+  }
+
+  async function handleChangePassword() {
+    setPasswordError(null);
+    if (newPasswordInput !== confirmPasswordInput) {
+      setPasswordError("New passwords don't match");
+      return;
+    }
+    setSavingPassword(true);
+    try {
+      await updatePassword(currentPasswordInput, newPasswordInput);
+      setCurrentPasswordInput("");
+      setNewPasswordInput("");
+      setConfirmPasswordInput("");
+      setPasswordFormOpen(false);
+    } catch (err) {
+      setPasswordError(err instanceof Error ? err.message : "Couldn't change password");
+    } finally {
+      setSavingPassword(false);
+    }
+  }
+
+  async function handleToggleNotifPref(key: string) {
+    const next = { ...notifPrefs, [key]: !notifPrefs[key] };
+    setNotifPrefs(next);
+    await updateNotificationPrefs(next);
+  }
+
   const tasksLoading = useDelayedLoading(`${activeSpaceId}:${activeView}:${isGuest}`, 350);
   const chatLoading = useDelayedLoading(activeChannel, 300);
-  const notifLoading = useDelayedLoading(`notif:${showNotifications}`, 300);
   const taskDetailLoading = useDelayedLoading(`task:${selectedTaskId}`, 300);
 
   const boardColumns = STATUSES.map((st) => ({
@@ -773,6 +1090,8 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
     total: sprintTasks.length,
     pct: sprintTasks.length ? Math.round((sprintDone / sprintTasks.length) * 100) : 0,
   };
+  const backlogList = isGuest ? undefined : activeSpace?.lists.find((l) => !l.isSprint);
+  const backlogTasks = isGuest ? [] : activeSpace?.lists.filter((l) => !l.isSprint).flatMap((l) => l.tasks) ?? [];
 
   const selectedTask = selectedTaskId ? tasksInSpace.find((t) => t.id === selectedTaskId) ?? null : null;
 
@@ -789,11 +1108,12 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
   });
 
   const chatItems = channels.map((c) => {
-    const active = c.id === activeChannel;
-    return { key: c.id, isDirect: c.isDirect, displayName: c.isDirect ? c.name : "#" + c.name, rowBg: active ? ACCENT_BG : "transparent", rowColor: active ? ACCENT_FG : "oklch(0.3 0.01 60)" };
+    const active = !isGuest && activeContext === "chat" && c.id === activeChannel;
+    const unread = active ? 0 : c.unread;
+    return { key: c.id, isDirect: c.isDirect, unread, displayName: c.isDirect ? c.name : "#" + c.name, rowBg: active ? ACCENT_BG : "transparent", rowColor: active ? ACCENT_FG : "oklch(0.3 0.01 60)" };
   });
-  const groupChatItems = chatItems.filter((c) => !c.isDirect);
-  const dmChatItems = chatItems.filter((c) => c.isDirect);
+  const chatPreviewItems = chatSidebarExpanded ? chatItems : chatItems.slice(0, 5);
+  const chatHasMore = !chatSidebarExpanded && chatItems.length > 5;
   const dmCandidates = members.filter((m) => m.id !== currentUser.id);
 
   const channelName = chatItems.find((c) => c.key === activeChannel)?.displayName ?? "";
@@ -817,12 +1137,76 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
 
   const navColor = (ctx: typeof activeContext) => (!isGuest && activeContext === ctx ? "oklch(0.68 0.16 35)" : NEUTRAL_FG);
 
-  const topTitle = showChat ? "Chat" : showNotifications ? "Notifications" : showManage ? "Manage" : isGuest ? "Shared with you" : `${activeSpace?.name ?? ""}`;
+  const manageSpace = manageSpaceId ? spaces.find((s) => s.id === manageSpaceId) ?? null : null;
+  const viewLabel = activeView === "sprint" ? sprintInfo.name : activeView === "list" ? "List" : "Board";
+  const crumbs: { label: string; onClick?: () => void }[] = showChat
+    ? [{ label: "Chat" }]
+    : showSettings
+    ? [{ label: "Settings" }]
+    : showManage
+    ? manageSpace
+      ? [{ label: manageSpace.name, onClick: () => setManageSpaceId(null) }, { label: "Settings" }]
+      : [{ label: "Admin console" }]
+    : isGuest
+    ? [{ label: "Shared with you" }]
+    : [{ label: activeSpace?.name ?? "", onClick: () => selectContext("tasks") }, { label: viewLabel }];
+
   const unreadNotifCount = notifications.filter((n) => !n.read).length;
 
   if (bootLoading) {
     return <AppSkeleton />;
   }
+
+  const chatSidebarSection = (
+    <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "0 8px 4px" }}>
+        <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.55 0.01 60)", textTransform: "uppercase", letterSpacing: "0.04em" }}>Chat</div>
+        <button
+          onClick={() => setShowDmPicker((v) => !v)}
+          title="Start a direct message"
+          style={{ border: "none", background: "transparent", cursor: "pointer", fontSize: 15, fontWeight: 700, color: "oklch(0.55 0.01 60)", lineHeight: 1, padding: "0 4px" }}
+        >
+          +
+        </button>
+      </div>
+      {showDmPicker && (
+        <select
+          value=""
+          onChange={(e) => e.target.value && handleStartDm(e.target.value)}
+          style={{ margin: "0 8px 6px", fontSize: 12.5, padding: "6px 8px", borderRadius: 8, border: "1px solid oklch(0.88 0.006 60)", background: "#fff", fontFamily: "inherit" }}
+        >
+          <option value="">Message someone&hellip;</option>
+          {dmCandidates.map((m) => (
+            <option key={m.id} value={m.id}>{m.name}</option>
+          ))}
+        </select>
+      )}
+      {chatPreviewItems.map((ch) => (
+        <button
+          key={ch.key}
+          onClick={() => selectChannel(ch.key)}
+          style={{ display: "flex", alignItems: "center", gap: 10, padding: 8, border: "none", borderRadius: 8, cursor: "pointer", textAlign: "left", background: ch.rowBg }}
+        >
+          <div style={{ width: 22, height: 22, borderRadius: 6, background: "oklch(0.9 0.006 60)", flex: "none" }} />
+          <div style={{ fontSize: 13, fontWeight: 600, color: ch.rowColor, flex: 1, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{ch.displayName}</div>
+          {ch.unread > 0 && (
+            <div style={{ fontSize: 10, fontWeight: 800, background: "oklch(0.68 0.16 35)", color: "#fff", borderRadius: 999, padding: "1px 6px", flex: "none" }}>{ch.unread}</div>
+          )}
+        </button>
+      ))}
+      {chatItems.length === 0 && <div style={{ fontSize: 12, color: MUTED_FG, padding: "0 8px" }}>No conversations yet.</div>}
+      {chatHasMore && (
+        <button onClick={() => setChatSidebarExpanded(true)} style={{ textAlign: "left", padding: "6px 8px", border: "none", background: "transparent", fontSize: 12, fontWeight: 700, color: "oklch(0.5 0.14 240)", cursor: "pointer" }}>
+          View more
+        </button>
+      )}
+      {chatError && (
+        <div style={{ fontSize: 11.5, fontWeight: 600, color: "oklch(0.5 0.18 25)", background: "oklch(0.95 0.05 25)", borderRadius: 8, padding: "6px 8px", margin: "4px 8px 0" }}>
+          {chatError}
+        </div>
+      )}
+    </div>
+  );
 
   return (
     <div
@@ -852,21 +1236,134 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
           </button>
         )}
         <Image src="/logo-black.png" alt="Rally" width={2029} height={775} priority style={{ height: "auto", width: 80, flex: "none", maxWidth: 2029, maxHeight: 775   }} />
-        <div style={{ fontSize: 13.5, fontWeight: 600, color: "oklch(0.42 0.01 60)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", paddingLeft: 6, borderLeft: "1px solid oklch(0.9 0.006 60)", marginLeft: 2 }}>
-          {topTitle}
+        <div style={{ display: "flex", alignItems: "center", gap: 6, paddingLeft: 6, borderLeft: "1px solid oklch(0.9 0.006 60)", marginLeft: 2, minWidth: 0, overflow: "hidden" }}>
+          {!isGuest && (
+            <>
+              <button
+                onClick={() => selectContext("tasks")}
+                style={{ border: "none", background: "transparent", padding: 0, fontSize: 13.5, fontWeight: 600, color: "oklch(0.5 0.01 60)", cursor: "pointer", whiteSpace: "nowrap" }}
+              >
+                {workspaceName}
+              </button>
+              <div style={{ fontSize: 13, color: "oklch(0.75 0.006 60)" }}>/</div>
+            </>
+          )}
+          {crumbs.map((crumb, i) => (
+            <div key={i} style={{ display: "flex", alignItems: "center", gap: 6, minWidth: 0 }}>
+              {crumb.onClick ? (
+                <button onClick={crumb.onClick} style={{ border: "none", background: "transparent", padding: 0, fontSize: 13.5, fontWeight: 600, color: "oklch(0.5 0.01 60)", cursor: "pointer", whiteSpace: "nowrap" }}>
+                  {crumb.label}
+                </button>
+              ) : (
+                <div style={{ fontSize: 13.5, fontWeight: 700, color: "oklch(0.25 0.01 60)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{crumb.label}</div>
+              )}
+              {i < crumbs.length - 1 && <div style={{ fontSize: 13, color: "oklch(0.75 0.006 60)" }}>/</div>}
+            </div>
+          ))}
         </div>
         {isGuest && (
           <div style={{ fontSize: 10.5, fontWeight: 800, padding: "3px 8px", borderRadius: 999, background: "oklch(0.9 0.05 35)", color: "oklch(0.4 0.12 35)", flex: "none" }}>GUEST</div>
         )}
         <div style={{ flex: 1 }} />
-        <AvatarCircle a={currentUser} size={32} fontSize={12} />
-        <button
-          onClick={() => signOut({ callbackUrl: "/login" })}
-          title="Sign out"
-          style={{ fontSize: 12.5, fontWeight: 600, color: "oklch(0.5 0.01 60)", background: "transparent", border: "none", cursor: "pointer", flex: "none", padding: "6px 4px" }}
-        >
-          Sign out
-        </button>
+        {!isGuest && (
+          <div style={{ position: "relative", flex: "none" }}>
+            <button
+              onClick={() => setNotifOpen((v) => !v)}
+              title="Notifications"
+              style={{ position: "relative", width: 36, height: 36, borderRadius: 8, border: "none", background: notifOpen ? "oklch(0.95 0.006 60)" : "transparent", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}
+            >
+              <div style={{ width: 16, height: 16, borderRadius: "50% 50% 8px 8px", border: "2px solid oklch(0.35 0.01 60)" }} />
+              {unreadNotifCount > 0 && (
+                <div style={{ position: "absolute", top: 6, right: 6, width: 8, height: 8, borderRadius: "50%", background: "oklch(0.62 0.19 25)", border: "1.5px solid #fff" }} />
+              )}
+            </button>
+            {notifOpen && (
+              <>
+                <div style={{ position: "fixed", inset: 0, zIndex: 45 }} onClick={() => setNotifOpen(false)} />
+                <div style={{ position: "absolute", top: 44, right: 0, width: 340, maxHeight: 420, overflowY: "auto", background: "#fff", border: "1px solid oklch(0.9 0.006 60)", borderRadius: 12, boxShadow: "0 12px 32px oklch(0 0 0 / 0.14)", zIndex: 46, padding: 8 }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "8px 8px 10px" }}>
+                    <div style={{ fontSize: 13.5, fontWeight: 800 }}>Notifications</div>
+                    {unreadNotifCount > 0 && (
+                      <button
+                        onClick={() => markAllNotificationsRead()}
+                        style={{ border: "none", background: "transparent", color: "oklch(0.5 0.14 240)", fontSize: 12, fontWeight: 700, cursor: "pointer" }}
+                      >
+                        Mark all read
+                      </button>
+                    )}
+                  </div>
+                  {notifications.length === 0 ? (
+                    <div style={{ padding: "24px 8px", textAlign: "center", fontSize: 12.5, color: "oklch(0.55 0.01 60)" }}>You&apos;re all caught up</div>
+                  ) : (
+                    notifications.map((n) => (
+                      <div
+                        key={n.id}
+                        onClick={() => handleOpenNotification(n)}
+                        style={{ display: "flex", alignItems: "flex-start", gap: 10, padding: "10px 8px", borderRadius: 8, cursor: "pointer", background: n.read ? "transparent" : "oklch(0.97 0.006 60)" }}
+                      >
+                        <div style={{ width: 7, height: 7, borderRadius: "50%", marginTop: 5, background: n.read ? "oklch(0.85 0.006 60)" : "oklch(0.68 0.16 35)", flex: "none" }} />
+                        <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                          <div style={{ fontSize: 13, color: "oklch(0.25 0.01 60)", lineHeight: 1.4 }}>{n.text}</div>
+                          <div style={{ fontSize: 11, color: "oklch(0.55 0.01 60)" }}>{n.time}</div>
+                        </div>
+                      </div>
+                    ))
+                  )}
+                </div>
+              </>
+            )}
+          </div>
+        )}
+        <div style={{ position: "relative", flex: "none" }}>
+          <button
+            onClick={() => setProfileMenuOpen((v) => !v)}
+            style={{ border: "none", background: "transparent", padding: 0, cursor: "pointer", display: "flex", alignItems: "center", gap: 4 }}
+          >
+            <AvatarCircle a={currentUser} size={32} fontSize={12} />
+            {!isGuest && <div style={{ fontSize: 11, color: "oklch(0.6 0.01 60)" }}>&#9662;</div>}
+          </button>
+          {profileMenuOpen && (
+            <>
+              <div style={{ position: "fixed", inset: 0, zIndex: 45 }} onClick={() => setProfileMenuOpen(false)} />
+              <div style={{ position: "absolute", top: 44, right: 0, width: 220, background: "#fff", border: "1px solid oklch(0.9 0.006 60)", borderRadius: 12, boxShadow: "0 12px 32px oklch(0 0 0 / 0.14)", zIndex: 46, padding: 8, display: "flex", flexDirection: "column", gap: 2 }}>
+                <div style={{ padding: "8px 10px 10px", borderBottom: "1px solid oklch(0.93 0.006 60)", marginBottom: 4 }}>
+                  <div style={{ fontSize: 13, fontWeight: 700, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{currentUser.name}</div>
+                  {!isGuest && <div style={{ fontSize: 11.5, color: "oklch(0.55 0.01 60)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{currentUserEmail}</div>}
+                </div>
+                {!isGuest && (
+                  <button
+                    onClick={() => {
+                      setActiveContext("settings");
+                      setProfileMenuOpen(false);
+                    }}
+                    style={{ textAlign: "left", border: "none", background: "transparent", padding: "9px 10px", borderRadius: 8, fontSize: 13, fontWeight: 600, color: "oklch(0.28 0.01 60)", cursor: "pointer" }}
+                  >
+                    Settings
+                  </button>
+                )}
+                {canManage && (
+                  <button
+                    onClick={() => {
+                      setActiveContext("manage");
+                      setManageSpaceId(null);
+                      setProfileMenuOpen(false);
+                    }}
+                    style={{ textAlign: "left", border: "none", background: "transparent", padding: "9px 10px", borderRadius: 8, fontSize: 13, fontWeight: 600, color: "oklch(0.28 0.01 60)", cursor: "pointer" }}
+                  >
+                    Admin console
+                  </button>
+                )}
+                <div style={{ height: 1, background: "oklch(0.93 0.006 60)", margin: "4px 0" }} />
+                <button
+                  onClick={() => signOut({ callbackUrl: "/login" })}
+                  style={{ textAlign: "left", border: "none", background: "transparent", padding: "9px 10px", borderRadius: 8, fontSize: 13, fontWeight: 600, color: "oklch(0.55 0.16 25)", cursor: "pointer" }}
+                >
+                  Sign out
+                </button>
+              </div>
+            </>
+          )}
+        </div>
       </div>
 
       <div style={{ flex: 1, display: "flex", minHeight: 0, position: "relative" }}>
@@ -874,55 +1371,36 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
         <div className="rl-sidebar" style={{ width: 260, flex: "none", flexDirection: "column", borderRight: "1px solid oklch(0.9 0.006 60)", background: "oklch(0.97 0.006 60)", padding: "16px 12px", gap: 18, overflowY: "auto" }}>
           {!isGuest && (
             <>
+              <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.5 0.01 60)", letterSpacing: "0.04em", padding: "0 8px" }}>{workspaceName.toUpperCase()}</div>
               <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
                 <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.55 0.01 60)", textTransform: "uppercase", letterSpacing: "0.04em", padding: "0 8px 4px" }}>Spaces</div>
                 {spaceRows.map((sp) => (
-                  <button
-                    key={sp.id}
-                    onClick={() => selectSpace(sp.id)}
-                    style={{ display: "flex", alignItems: "center", gap: 10, padding: 8, border: "none", borderRadius: 8, cursor: "pointer", textAlign: "left", background: sp.rowBg }}
-                  >
-                    <div style={{ width: 26, height: 26, borderRadius: 7, background: `oklch(0.85 0.08 ${sp.hue})`, color: `oklch(0.3 0.1 ${sp.hue})`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 800, flex: "none" }}>
-                      {sp.initial}
-                    </div>
-                    <div style={{ display: "flex", flexDirection: "column", minWidth: 0 }}>
-                      <div style={{ fontSize: 13, fontWeight: 700, color: sp.rowColor, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{sp.name}</div>
-                      <div style={{ fontSize: 11.5, color: "oklch(0.5 0.01 60)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{sp.listLabel}</div>
-                    </div>
-                  </button>
+                  <div key={sp.id} style={{ display: "flex", alignItems: "center", borderRadius: 8, background: sp.rowBg }}>
+                    <button
+                      onClick={() => selectSpace(sp.id)}
+                      style={{ display: "flex", alignItems: "center", gap: 10, padding: 8, border: "none", background: "transparent", borderRadius: 8, cursor: "pointer", textAlign: "left", flex: 1, minWidth: 0 }}
+                    >
+                      <div style={{ width: 26, height: 26, borderRadius: 7, background: `oklch(0.85 0.08 ${sp.hue})`, color: `oklch(0.3 0.1 ${sp.hue})`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 800, flex: "none" }}>
+                        {sp.initial}
+                      </div>
+                      <div style={{ display: "flex", flexDirection: "column", minWidth: 0 }}>
+                        <div style={{ fontSize: 13, fontWeight: 700, color: sp.rowColor, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{sp.name}</div>
+                        <div style={{ fontSize: 11.5, color: "oklch(0.5 0.01 60)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{sp.listLabel}</div>
+                      </div>
+                    </button>
+                    {canManage && (
+                      <button
+                        onClick={() => openSpaceSettings(sp.id)}
+                        title="Space settings"
+                        style={{ flex: "none", width: 24, height: 24, marginRight: 4, border: "none", background: "transparent", borderRadius: 6, cursor: "pointer", color: "oklch(0.55 0.01 60)", fontSize: 14 }}
+                      >
+                        &#8942;
+                      </button>
+                    )}
+                  </div>
                 ))}
               </div>
-              <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-                <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.55 0.01 60)", textTransform: "uppercase", letterSpacing: "0.04em", padding: "0 8px 4px" }}>Team</div>
-                <button
-                  onClick={() => selectContext("chat")}
-                  style={{ display: "flex", alignItems: "center", gap: 10, padding: 8, border: "none", borderRadius: 8, cursor: "pointer", textAlign: "left", background: !isGuest && activeContext === "chat" ? ACCENT_BG : "transparent" }}
-                >
-                  <div style={{ width: 26, height: 26, borderRadius: 7, background: "oklch(0.9 0.006 60)", flex: "none", position: "relative" }}>
-                    <div style={{ position: "absolute", inset: 5, borderRadius: "5px 5px 5px 1px", background: "oklch(0.5 0.01 60)" }} />
-                  </div>
-                  <div style={{ fontSize: 13, fontWeight: 700, color: !isGuest && activeContext === "chat" ? ACCENT_FG : "oklch(0.3 0.01 60)", flex: 1 }}>Chat</div>
-                </button>
-                <button
-                  onClick={() => selectContext("notifications")}
-                  style={{ display: "flex", alignItems: "center", gap: 10, padding: 8, border: "none", borderRadius: 8, cursor: "pointer", textAlign: "left", background: !isGuest && activeContext === "notifications" ? ACCENT_BG : "transparent" }}
-                >
-                  <div style={{ width: 26, height: 26, borderRadius: "50% 50% 8px 8px", background: "oklch(0.5 0.01 60)", flex: "none" }} />
-                  <div style={{ fontSize: 13, fontWeight: 700, color: !isGuest && activeContext === "notifications" ? ACCENT_FG : "oklch(0.3 0.01 60)", flex: 1 }}>Notifications</div>
-                  {unreadNotifCount > 0 && (
-                    <div style={{ fontSize: 10.5, fontWeight: 800, background: "oklch(0.68 0.16 35)", color: "#fff", borderRadius: 999, padding: "1px 7px", minWidth: 16, textAlign: "center" }}>{unreadNotifCount}</div>
-                  )}
-                </button>
-                {canManage && (
-                  <button
-                    onClick={() => selectContext("manage")}
-                    style={{ display: "flex", alignItems: "center", gap: 10, padding: 8, border: "none", borderRadius: 8, cursor: "pointer", textAlign: "left", background: activeContext === "manage" ? ACCENT_BG : "transparent" }}
-                  >
-                    <div style={{ width: 26, height: 26, borderRadius: 7, background: "oklch(0.5 0.01 60)", flex: "none" }} />
-                    <div style={{ fontSize: 13, fontWeight: 700, color: activeContext === "manage" ? ACCENT_FG : "oklch(0.3 0.01 60)", flex: 1 }}>Manage</div>
-                  </button>
-                )}
-              </div>
+              {chatSidebarSection}
             </>
           )}
           {isGuest && (
@@ -1049,9 +1527,11 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
                         {col.tasks.map((task) => {
                           const priorityInfo = PRIORITY[task.priority];
                           const blockedCount = task.dependsOn.filter((d) => d.status !== "done").length;
+                          const overdue = isOverdue(task);
                           return (
                             <button
                               key={task.id}
+                              className="rl-taskcard"
                               onClick={() => openTask(task.id)}
                               draggable={!isGuest}
                               onDragStart={(e) => {
@@ -1062,19 +1542,19 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
                                 setDraggedTaskId(null);
                                 setDragOverStatus(null);
                               }}
-                              style={{ textAlign: "left", background: "#fff", border: "1px solid oklch(0.91 0.006 60)", borderRadius: 12, padding: 12, cursor: isGuest ? "pointer" : "grab", display: "flex", flexDirection: "column", gap: 8, boxShadow: "0 1px 2px oklch(0 0 0 / 0.04)", opacity: draggedTaskId === task.id ? 0.4 : 1 }}
+                              style={{ textAlign: "left", background: "#fff", border: "1px solid oklch(0.91 0.006 60)", borderRadius: 12, padding: 14, cursor: isGuest ? "pointer" : "grab", display: "flex", flexDirection: "column", gap: 10, boxShadow: "0 1px 2px oklch(0 0 0 / 0.04)", opacity: draggedTaskId === task.id ? 0.4 : 1 }}
                             >
-                              <div style={{ fontSize: 13.5, fontWeight: 600, lineHeight: 1.35, color: "oklch(0.22 0.01 60)" }}>{task.title}</div>
+                              <div style={{ fontSize: 13.5, fontWeight: 700, lineHeight: 1.4, color: "oklch(0.2 0.01 60)" }}>{task.title}</div>
+                              {blockedCount > 0 && (
+                                <Pill bg="oklch(0.9 0.09 25)" fg="oklch(0.4 0.15 25)">
+                                  Blocked &times;{blockedCount}
+                                </Pill>
+                              )}
                               <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
                                 <Pill bg={priorityInfo.bg} fg={priorityInfo.fg}>
                                   {priorityInfo.label}
                                 </Pill>
-                                {blockedCount > 0 && (
-                                  <Pill bg="oklch(0.9 0.09 25)" fg="oklch(0.4 0.15 25)">
-                                    Blocked &times;{blockedCount}
-                                  </Pill>
-                                )}
-                                <span style={{ fontSize: 11.5, color: "oklch(0.5 0.01 60)" }}>{task.due}</span>
+                                <span style={{ fontSize: 11.5, fontWeight: overdue ? 700 : 400, color: overdue ? "oklch(0.55 0.18 25)" : "oklch(0.5 0.01 60)" }}>{task.due}</span>
                                 <div style={{ flex: 1 }} />
                                 <AvatarStack avatars={task.assignees} size={22} fontSize={9.5} />
                               </div>
@@ -1111,7 +1591,7 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
                             {priorityInfo.label}
                           </Pill>
                         </div>
-                        <div style={{ width: 90, fontSize: 12, color: "oklch(0.5 0.01 60)" }}>{task.due}</div>
+                        <div style={{ width: 90, fontSize: 12, fontWeight: isOverdue(task) ? 700 : 400, color: isOverdue(task) ? "oklch(0.55 0.18 25)" : "oklch(0.5 0.01 60)" }}>{task.due}</div>
                         <div style={{ width: 36, display: "flex", justifyContent: "flex-end" }}>
                           <AvatarStack avatars={task.assignees} size={22} fontSize={9.5} />
                         </div>
@@ -1120,25 +1600,52 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
                   })}
                 </div>
               ) : (
-                <div style={{ flex: 1, overflowY: "auto", padding: 20 }}>
-                  {!isGuest && sprintLists.length > 1 && (
-                    <select
-                      value={sprintList?.id ?? ""}
-                      onChange={(e) => setSelectedSprintId(e.target.value)}
-                      style={{ marginBottom: 12, fontSize: 12.5, fontWeight: 700, padding: "6px 10px", borderRadius: 8, border: "1px solid oklch(0.88 0.006 60)", background: "#fff", fontFamily: "inherit" }}
-                    >
+                <div style={{ flex: 1, overflowY: "auto", padding: 20, display: "flex", flexDirection: "column", gap: 16 }}>
+                  {!isGuest && (
+                    <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
                       {sprintLists.map((l) => (
-                        <option key={l.id} value={l.id}>{l.name}</option>
+                        <button
+                          key={l.id}
+                          onClick={() => setSelectedSprintId(l.id)}
+                          style={{ border: "none", borderRadius: 999, padding: "6px 14px", fontSize: 12.5, fontWeight: 700, cursor: "pointer", background: sprintList?.id === l.id ? "oklch(0.68 0.16 35)" : "oklch(0.93 0.006 60)", color: sprintList?.id === l.id ? "#fff" : "oklch(0.4 0.01 60)" }}
+                        >
+                          {l.name}
+                        </button>
                       ))}
-                    </select>
+                      <button
+                        onClick={() => setShowSprintForm((v) => !v)}
+                        style={{ border: "1px dashed oklch(0.75 0.006 60)", borderRadius: 999, padding: "6px 14px", fontSize: 12.5, fontWeight: 700, cursor: "pointer", background: "transparent", color: "oklch(0.5 0.01 60)" }}
+                      >
+                        + New sprint
+                      </button>
+                    </div>
+                  )}
+                  {showSprintForm && (
+                    <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center", background: "#fff", border: "1px solid oklch(0.91 0.006 60)", borderRadius: 10, padding: 12 }}>
+                      <input
+                        value={newSprintName}
+                        onChange={(e) => setNewSprintName(e.target.value)}
+                        placeholder="Sprint name"
+                        style={{ flex: 1, minWidth: 140, border: "1px solid oklch(0.88 0.006 60)", borderRadius: 8, padding: "8px 10px", fontSize: 13, fontFamily: "inherit" }}
+                      />
+                      <input type="date" value={newSprintStart} onChange={(e) => setNewSprintStart(e.target.value)} style={{ border: "1px solid oklch(0.88 0.006 60)", borderRadius: 8, padding: "8px 10px", fontSize: 12.5, fontFamily: "inherit" }} />
+                      <span style={{ fontSize: 12, color: "oklch(0.55 0.01 60)" }}>to</span>
+                      <input type="date" value={newSprintEnd} onChange={(e) => setNewSprintEnd(e.target.value)} style={{ border: "1px solid oklch(0.88 0.006 60)", borderRadius: 8, padding: "8px 10px", fontSize: 12.5, fontFamily: "inherit" }} />
+                      <button onClick={handleCreateSprint} disabled={!newSprintName.trim() || creatingSprint} style={{ border: "none", background: "oklch(0.68 0.16 35)", color: "#fff", fontSize: 12.5, fontWeight: 700, padding: "0 14px", height: 34, borderRadius: 8, cursor: "pointer", opacity: !newSprintName.trim() || creatingSprint ? 0.6 : 1 }}>
+                        Create
+                      </button>
+                      <button onClick={() => setShowSprintForm(false)} style={{ border: "none", background: "transparent", color: "oklch(0.5 0.01 60)", fontSize: 12.5, fontWeight: 700, cursor: "pointer" }}>
+                        Cancel
+                      </button>
+                    </div>
                   )}
                   {!sprintList ? (
                     <div style={{ fontSize: 13, color: "oklch(0.55 0.01 60)", padding: "20px 4px" }}>
-                      {isGuest ? "Nothing shared yet." : "No sprint yet. Click “+ List” above and check “Sprint” to start one."}
+                      {isGuest ? "Nothing shared yet." : "No sprint yet. Click “+ New sprint” above to start one."}
                     </div>
                   ) : (
                     <>
-                      <div style={{ background: "#fff", border: "1px solid oklch(0.91 0.006 60)", borderRadius: 12, padding: 16, marginBottom: 16, display: "flex", flexDirection: "column", gap: 10 }}>
+                      <div style={{ background: "#fff", border: "1px solid oklch(0.91 0.006 60)", borderRadius: 12, padding: 16, display: "flex", flexDirection: "column", gap: 10, flex: "none" }}>
                         <div style={{ display: "flex", alignItems: "baseline", gap: 10 }}>
                           <div style={{ fontSize: 15, fontWeight: 800 }}>{sprintInfo.name}</div>
                           {(sprintList.sprintStart || sprintList.sprintEnd) && (
@@ -1154,24 +1661,85 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
                           {sprintInfo.done} of {sprintInfo.total} tasks done
                         </div>
                       </div>
-                      {sprintTasks.map((task) => {
-                        const statusColor = STATUSES.find((s) => s.key === task.status)!.color;
-                        const statusLabel = STATUSES.find((s) => s.key === task.status)!.label;
-                        return (
-                          <button
-                            key={task.id}
-                            onClick={() => openTask(task.id)}
-                            style={{ width: "100%", display: "flex", alignItems: "center", gap: 12, padding: "10px 12px", border: "none", borderTop: "1px solid oklch(0.93 0.006 60)", background: "#fff", cursor: "pointer", textAlign: "left" }}
-                          >
-                            <div style={{ flex: 1, display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
-                              <div style={{ width: 8, height: 8, borderRadius: "50%", background: statusColor, flex: "none" }} />
-                              <div style={{ fontSize: 13.5, fontWeight: 600, color: "oklch(0.22 0.01 60)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{task.title}</div>
+                      {isGuest ? (
+                        sprintTasks.map((task) => {
+                          const statusColor = STATUSES.find((s) => s.key === task.status)!.color;
+                          const statusLabel = STATUSES.find((s) => s.key === task.status)!.label;
+                          return (
+                            <button
+                              key={task.id}
+                              onClick={() => openTask(task.id)}
+                              style={{ width: "100%", display: "flex", alignItems: "center", gap: 12, padding: "10px 12px", border: "none", borderTop: "1px solid oklch(0.93 0.006 60)", background: "#fff", cursor: "pointer", textAlign: "left" }}
+                            >
+                              <div style={{ flex: 1, display: "flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+                                <div style={{ width: 8, height: 8, borderRadius: "50%", background: statusColor, flex: "none" }} />
+                                <div style={{ fontSize: 13.5, fontWeight: 600, color: "oklch(0.22 0.01 60)", whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{task.title}</div>
+                              </div>
+                              <div style={{ fontSize: 11.5, color: "oklch(0.5 0.01 60)", width: 120 }}>{statusLabel}</div>
+                              <div style={{ width: 90, fontSize: 12, color: "oklch(0.5 0.01 60)" }}>{task.due}</div>
+                            </button>
+                          );
+                        })
+                      ) : (
+                        <div className="rl-sprint-grid" style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, flex: 1, minHeight: 280 }}>
+                          {(
+                            [
+                              { key: "backlog" as const, label: "Backlog", tasks: backlogTasks, targetListId: backlogList?.id },
+                              { key: "sprint" as const, label: "This sprint", tasks: sprintTasks, targetListId: sprintList.id },
+                            ]
+                          ).map((col) => (
+                            <div
+                              key={col.key}
+                              onDragOver={(e) => {
+                                if (!draggedTaskId || !col.targetListId) return;
+                                e.preventDefault();
+                                setDragOverColumn(col.key);
+                              }}
+                              onDragLeave={() => setDragOverColumn((c) => (c === col.key ? null : c))}
+                              onDrop={(e) => {
+                                e.preventDefault();
+                                setDragOverColumn(null);
+                                const taskId = draggedTaskId;
+                                setDraggedTaskId(null);
+                                if (!taskId || !col.targetListId) return;
+                                handleMoveTask(taskId, col.targetListId);
+                              }}
+                              style={{ display: "flex", flexDirection: "column", gap: 8, background: dragOverColumn === col.key ? "oklch(0.93 0.05 35)" : "oklch(0.97 0.006 60)", borderRadius: 12, padding: 12, minHeight: 200, transition: "background 0.1s" }}
+                            >
+                              <div style={{ fontSize: 12, fontWeight: 700, color: "oklch(0.45 0.01 60)", textTransform: "uppercase", letterSpacing: "0.03em", padding: "0 4px" }}>
+                                {col.label} &middot; {col.tasks.length}
+                              </div>
+                              {col.tasks.map((task) => {
+                                const priorityInfo = PRIORITY[task.priority];
+                                const statusColor = STATUSES.find((s) => s.key === task.status)!.color;
+                                return (
+                                  <button
+                                    key={task.id}
+                                    draggable
+                                    onDragStart={(e) => {
+                                      setDraggedTaskId(task.id);
+                                      e.dataTransfer.effectAllowed = "move";
+                                    }}
+                                    onDragEnd={() => {
+                                      setDraggedTaskId(null);
+                                      setDragOverColumn(null);
+                                    }}
+                                    onClick={() => openTask(task.id)}
+                                    style={{ width: "100%", textAlign: "left", display: "flex", alignItems: "center", gap: 10, padding: 10, border: "1px solid oklch(0.91 0.006 60)", borderRadius: 10, background: "#fff", cursor: "grab", opacity: draggedTaskId === task.id ? 0.4 : 1 }}
+                                  >
+                                    <div style={{ width: 7, height: 7, borderRadius: "50%", background: statusColor, flex: "none" }} />
+                                    <div style={{ flex: 1, fontSize: 13, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{task.title}</div>
+                                    <Pill bg={priorityInfo.bg} fg={priorityInfo.fg}>{priorityInfo.label}</Pill>
+                                  </button>
+                                );
+                              })}
+                              {col.tasks.length === 0 && (
+                                <div style={{ fontSize: 12, color: MUTED_FG, padding: "8px 4px" }}>Nothing here.</div>
+                              )}
                             </div>
-                            <div style={{ fontSize: 11.5, color: "oklch(0.5 0.01 60)", width: 120 }}>{statusLabel}</div>
-                            <div style={{ width: 90, fontSize: 12, color: "oklch(0.5 0.01 60)" }}>{task.due}</div>
-                          </button>
-                        );
-                      })}
+                          ))}
+                        </div>
+                      )}
                     </>
                   )}
                 </div>
@@ -1180,66 +1748,8 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
           )}
 
           {showChat && (
-            <div style={{ flex: 1, display: "flex", minHeight: 0 }}>
-              <div
-                className={`rl-chatlist ${mobileChatShowList ? "" : "rl-hide-mobile"}`}
-                style={{ width: 240, flex: "none", borderRight: "1px solid oklch(0.9 0.006 60)", flexDirection: "column", overflowY: "auto", padding: "12px 8px", gap: 2 }}
-              >
-                <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.55 0.01 60)", textTransform: "uppercase", letterSpacing: "0.04em", padding: "0 8px 4px" }}>Channels</div>
-                {groupChatItems.map((ch) => (
-                  <button
-                    key={ch.key}
-                    onClick={() => selectChannel(ch.key)}
-                    style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", border: "none", borderRadius: 8, background: ch.rowBg, cursor: "pointer", textAlign: "left" }}
-                  >
-                    <div style={{ fontSize: 13, fontWeight: 600, color: ch.rowColor, flex: 1, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{ch.displayName}</div>
-                  </button>
-                ))}
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 8px 4px" }}>
-                  <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.55 0.01 60)", textTransform: "uppercase", letterSpacing: "0.04em" }}>Direct messages</div>
-                  <button
-                    onClick={() => setShowDmPicker((v) => !v)}
-                    title="Start a direct message"
-                    style={{ border: "none", background: "transparent", cursor: "pointer", fontSize: 15, fontWeight: 700, color: "oklch(0.55 0.01 60)", lineHeight: 1, padding: "0 4px" }}
-                  >
-                    +
-                  </button>
-                </div>
-                {showDmPicker && (
-                  <select
-                    value=""
-                    onChange={(e) => e.target.value && handleStartDm(e.target.value)}
-                    style={{ margin: "0 8px 4px", fontSize: 12.5, padding: "6px 8px", borderRadius: 8, border: "1px solid oklch(0.88 0.006 60)", background: "#fff", fontFamily: "inherit" }}
-                  >
-                    <option value="">Message someone&hellip;</option>
-                    {dmCandidates.map((m) => (
-                      <option key={m.id} value={m.id}>{m.name}</option>
-                    ))}
-                  </select>
-                )}
-                {dmChatItems.map((ch) => (
-                  <button
-                    key={ch.key}
-                    onClick={() => selectChannel(ch.key)}
-                    style={{ display: "flex", alignItems: "center", gap: 8, padding: "8px 10px", border: "none", borderRadius: 8, background: ch.rowBg, cursor: "pointer", textAlign: "left" }}
-                  >
-                    <div style={{ fontSize: 13, fontWeight: 600, color: ch.rowColor, flex: 1, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{ch.displayName}</div>
-                  </button>
-                ))}
-                {dmChatItems.length === 0 && !showDmPicker && (
-                  <div style={{ fontSize: 12, color: MUTED_FG, padding: "0 8px" }}>No conversations yet.</div>
-                )}
-                {chatError && (
-                  <div style={{ fontSize: 11.5, fontWeight: 600, color: "oklch(0.5 0.18 25)", background: "oklch(0.95 0.05 25)", borderRadius: 8, padding: "6px 8px", margin: "4px 8px 0" }}>
-                    {chatError}
-                  </div>
-                )}
-              </div>
-              <div className={`rl-chatthread ${mobileChatShowList ? "rl-hide-mobile" : ""}`} style={{ flex: 1, flexDirection: "column", minWidth: 0 }}>
+            <div style={{ flex: 1, display: "flex", flexDirection: "column", minWidth: 0, minHeight: 0 }}>
                 <div style={{ flex: "none", display: "flex", alignItems: "center", gap: 8, padding: "10px 16px", borderBottom: "1px solid oklch(0.9 0.006 60)" }}>
-                  <button className="rl-mobile-only" onClick={backToChatList} style={{ display: "none", border: "none", background: "transparent", fontSize: 18, cursor: "pointer", padding: "2px 6px 2px 0" }}>
-                    &lsaquo;
-                  </button>
                   <div style={{ fontSize: 14, fontWeight: 700 }}>{channelName}</div>
                 </div>
                 {chatLoading ? (
@@ -1258,7 +1768,7 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
                                 <div style={{ fontSize: 13, fontWeight: 700 }}>{m.author.name}</div>
                                 <div style={{ fontSize: 11, color: "oklch(0.55 0.01 60)" }}>{m.time}</div>
                               </div>
-                              <Markdown text={m.text} />
+                              <ChatMessageBody text={m.text} findTask={(id) => taskById.get(id)} onOpenTask={openTaskGlobal} />
                               <button
                                 onClick={() => setReplyingTo(m)}
                                 style={{ alignSelf: "flex-start", border: "none", background: "none", fontSize: 11, fontWeight: 700, color: MUTED_FG, cursor: "pointer", padding: 0 }}
@@ -1285,7 +1795,7 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
                                         <div style={{ fontSize: 12.5, fontWeight: 700 }}>{r.author.name}</div>
                                         <div style={{ fontSize: 10.5, color: "oklch(0.55 0.01 60)" }}>{r.time}</div>
                                       </div>
-                                      <Markdown text={r.text} />
+                                      <ChatMessageBody text={r.text} findTask={(id) => taskById.get(id)} onOpenTask={openTaskGlobal} />
                                     </div>
                                   </div>
                                 ))
@@ -1322,41 +1832,137 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
                     &uarr;
                   </button>
                 </div>
+            </div>
+          )}
+
+          {showManage && manageSpace && (
+            <div style={{ flex: 1, overflowY: "auto", padding: 20, display: "flex", flexDirection: "column", gap: 24, maxWidth: 640 }}>
+              <button
+                onClick={() => setManageSpaceId(null)}
+                style={{ alignSelf: "flex-start", border: "none", background: "transparent", padding: 0, fontSize: 12.5, fontWeight: 700, color: "oklch(0.5 0.14 240)", cursor: "pointer" }}
+              >
+                &lsaquo; Admin console
+              </button>
+              <div>
+                <div style={{ fontSize: 16, fontWeight: 800, marginBottom: 2 }}>{manageSpace.name} settings</div>
+                <div style={{ fontSize: 12.5, color: MUTED_FG }}>Members and custom fields for this space only.</div>
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                <div style={{ fontSize: 13, fontWeight: 800, color: "oklch(0.3 0.01 60)" }}>Members</div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                  {manageSpace.members.map((m) => (
+                    <div key={m.id} style={{ display: "flex", alignItems: "center", gap: 6, background: "oklch(0.96 0.006 60)", borderRadius: 999, padding: "3px 6px 3px 3px" }}>
+                      <AvatarCircle a={m} size={20} fontSize={9} />
+                      <div style={{ fontSize: 12, fontWeight: 600 }}>{m.name}</div>
+                      {m.id !== currentUser.id && (
+                        <button
+                          onClick={() => removeFromSpace(manageSpace.id, m.id)}
+                          style={{ border: "none", background: "transparent", cursor: "pointer", fontSize: 12, color: "oklch(0.5 0.01 60)", padding: "0 2px" }}
+                        >
+                          &times;
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+                {(() => {
+                  const addable = members.filter((m) => !manageSpace.members.some((sm) => sm.id === m.id));
+                  return addable.length > 0 ? (
+                    <div style={{ display: "flex", gap: 6 }}>
+                      <select
+                        value={addMemberSelection[manageSpace.id] ?? ""}
+                        onChange={(e) => setAddMemberSelection((s) => ({ ...s, [manageSpace.id]: e.target.value }))}
+                        style={{ fontSize: 12.5, padding: "5px 8px", borderRadius: 8, border: "1px solid oklch(0.88 0.006 60)", background: "#fff", fontFamily: "inherit" }}
+                      >
+                        <option value="">Add existing member...</option>
+                        {addable.map((m) => (
+                          <option key={m.id} value={m.id}>{m.name}</option>
+                        ))}
+                      </select>
+                      <button
+                        onClick={() => handleAddMember(manageSpace.id)}
+                        disabled={!addMemberSelection[manageSpace.id]}
+                        style={{ fontSize: 12.5, fontWeight: 700, padding: "5px 10px", borderRadius: 8, border: "1px solid oklch(0.88 0.006 60)", background: "#fff", cursor: "pointer", opacity: addMemberSelection[manageSpace.id] ? 1 : 0.5 }}
+                      >
+                        Add
+                      </button>
+                    </div>
+                  ) : null;
+                })()}
+              </div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+                <div style={{ fontSize: 13, fontWeight: 800, color: "oklch(0.3 0.01 60)" }}>Custom fields</div>
+                {manageSpace.lists.map((list) => (
+                  <div key={list.id} style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    {manageSpace.lists.length > 1 && (
+                      <div style={{ fontSize: 11.5, fontWeight: 700, color: MUTED_FG }}>{list.name}</div>
+                    )}
+                    {list.customFields.map((field) => (
+                      <div key={field.id} style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 10px", border: "1px solid oklch(0.91 0.006 60)", borderRadius: 8 }}>
+                        <div style={{ flex: 1 }}>
+                          <div style={{ fontSize: 13, fontWeight: 600 }}>{field.name}</div>
+                          <div style={{ fontSize: 11, color: MUTED_FG }}>{field.type.toLowerCase()}{field.options.length ? ` · ${field.options.join(", ")}` : ""}</div>
+                        </div>
+                        <button onClick={() => handleDeleteCustomField(field.id)} style={{ border: "none", background: "transparent", color: "oklch(0.55 0.16 25)", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>
+                          Remove
+                        </button>
+                      </div>
+                    ))}
+                    {list.customFields.length === 0 && fieldFormListId !== list.id && (
+                      <div style={{ fontSize: 12, color: MUTED_FG }}>No custom fields on this list.</div>
+                    )}
+                    {fieldFormListId === list.id ? (
+                      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 4 }}>
+                        <input
+                          value={newFieldName}
+                          onChange={(e) => setNewFieldName(e.target.value)}
+                          placeholder="Field name"
+                          style={{ flex: 1, minWidth: 120, border: "1px solid oklch(0.88 0.006 60)", borderRadius: 8, padding: "8px 10px", fontSize: 13, fontFamily: "inherit" }}
+                        />
+                        <select
+                          value={newFieldType}
+                          onChange={(e) => setNewFieldType(e.target.value as UiCustomField["type"])}
+                          style={{ border: "1px solid oklch(0.88 0.006 60)", borderRadius: 8, padding: "8px 10px", fontSize: 13, background: "#fff", fontFamily: "inherit" }}
+                        >
+                          <option value="TEXT">Text</option>
+                          <option value="NUMBER">Number</option>
+                          <option value="DATE">Date</option>
+                          <option value="DROPDOWN">Dropdown</option>
+                        </select>
+                        {newFieldType === "DROPDOWN" && (
+                          <input
+                            value={newFieldOptions}
+                            onChange={(e) => setNewFieldOptions(e.target.value)}
+                            placeholder="Options, comma separated"
+                            style={{ flex: 2, minWidth: 180, border: "1px solid oklch(0.88 0.006 60)", borderRadius: 8, padding: "8px 10px", fontSize: 13, fontFamily: "inherit" }}
+                          />
+                        )}
+                        <button
+                          onClick={() => handleCreateCustomField(list.id)}
+                          disabled={!newFieldName.trim() || creatingField}
+                          style={{ border: "none", background: "oklch(0.68 0.16 35)", color: "#fff", fontSize: 12.5, fontWeight: 700, padding: "0 14px", borderRadius: 8, cursor: "pointer", opacity: !newFieldName.trim() || creatingField ? 0.6 : 1 }}
+                        >
+                          Add field
+                        </button>
+                        <button onClick={() => setFieldFormListId(null)} style={{ border: "none", background: "transparent", color: MUTED_FG, fontSize: 12.5, fontWeight: 700, cursor: "pointer" }}>
+                          Cancel
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        onClick={() => setFieldFormListId(list.id)}
+                        style={{ alignSelf: "flex-start", fontSize: 11.5, fontWeight: 700, color: "oklch(0.68 0.16 35)", background: "none", border: "none", cursor: "pointer", padding: 0 }}
+                      >
+                        + Add field
+                      </button>
+                    )}
+                  </div>
+                ))}
               </div>
             </div>
           )}
 
-          {showNotifications &&
-            (notifLoading ? (
-              <NotificationsSkeleton />
-            ) : (
-              <div style={{ flex: 1, overflowY: "auto", padding: 20, display: "flex", flexDirection: "column", gap: 10, maxWidth: 640 }}>
-                {unreadNotifCount > 0 && (
-                  <button
-                    onClick={() => markAllNotificationsRead()}
-                    style={{ alignSelf: "flex-end", fontSize: 12, fontWeight: 700, color: "oklch(0.68 0.16 35)", background: "none", border: "none", cursor: "pointer", padding: 0 }}
-                  >
-                    Mark all read
-                  </button>
-                )}
-                {notifications.length === 0 && <div style={{ fontSize: 13, color: MUTED_FG, padding: "14px 12px" }}>No notifications yet.</div>}
-                {notifications.map((n) => (
-                  <div
-                    key={n.id}
-                    onClick={() => handleOpenNotification(n)}
-                    style={{ display: "flex", alignItems: "flex-start", gap: 12, padding: "14px 12px", borderRadius: 10, cursor: "pointer", background: n.read ? "transparent" : "oklch(0.97 0.006 60)" }}
-                  >
-                    <div style={{ width: 8, height: 8, borderRadius: "50%", marginTop: 6, background: n.read ? "oklch(0.85 0.006 60)" : "oklch(0.68 0.16 35)", flex: "none" }} />
-                    <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
-                      <div style={{ fontSize: 13.5, color: "oklch(0.25 0.01 60)", lineHeight: 1.4 }}>{n.text}</div>
-                      <div style={{ fontSize: 11.5, color: "oklch(0.55 0.01 60)" }}>{n.time}</div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            ))}
-
-          {showManage && (
+          {showManage && !manageSpace && (
             <div style={{ flex: 1, overflowY: "auto", padding: 20, display: "flex", flexDirection: "column", gap: 28, maxWidth: 640 }}>
               {role === "OWNER" && (
                 <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
@@ -1388,6 +1994,7 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
               )}
               <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
                 <div style={{ fontSize: 13, fontWeight: 800, color: "oklch(0.3 0.01 60)" }}>Spaces</div>
+                <div style={{ fontSize: 12.5, color: MUTED_FG, marginTop: -6 }}>Per-space settings (members, custom fields) live inside each space.</div>
                 {role === "OWNER" && (
                   <div style={{ display: "flex", gap: 8 }}>
                     <input
@@ -1406,52 +2013,24 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
                     </button>
                   </div>
                 )}
-                <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                  {spaces.map((sp) => {
-                    const addable = members.filter((m) => !sp.members.some((sm) => sm.id === m.id));
-                    return (
-                      <div key={sp.id} style={{ border: "1px solid oklch(0.9 0.006 60)", borderRadius: 10, padding: 12, display: "flex", flexDirection: "column", gap: 8 }}>
-                        <div style={{ fontSize: 13.5, fontWeight: 700 }}>{sp.name}</div>
-                        <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-                          {sp.members.map((m) => (
-                            <div key={m.id} style={{ display: "flex", alignItems: "center", gap: 6, background: "oklch(0.96 0.006 60)", borderRadius: 999, padding: "3px 6px 3px 3px" }}>
-                              <AvatarCircle a={m} size={20} fontSize={9} />
-                              <div style={{ fontSize: 12, fontWeight: 600 }}>{m.name}</div>
-                              {m.id !== currentUser.id && (
-                                <button
-                                  onClick={() => removeFromSpace(sp.id, m.id)}
-                                  style={{ border: "none", background: "transparent", cursor: "pointer", fontSize: 12, color: "oklch(0.5 0.01 60)", padding: "0 2px" }}
-                                >
-                                  &times;
-                                </button>
-                              )}
-                            </div>
-                          ))}
-                        </div>
-                        {addable.length > 0 && (
-                          <div style={{ display: "flex", gap: 6 }}>
-                            <select
-                              value={addMemberSelection[sp.id] ?? ""}
-                              onChange={(e) => setAddMemberSelection((s) => ({ ...s, [sp.id]: e.target.value }))}
-                              style={{ fontSize: 12.5, padding: "5px 8px", borderRadius: 8, border: "1px solid oklch(0.88 0.006 60)", background: "#fff", fontFamily: "inherit" }}
-                            >
-                              <option value="">Add existing member...</option>
-                              {addable.map((m) => (
-                                <option key={m.id} value={m.id}>{m.name}</option>
-                              ))}
-                            </select>
-                            <button
-                              onClick={() => handleAddMember(sp.id)}
-                              disabled={!addMemberSelection[sp.id]}
-                              style={{ fontSize: 12.5, fontWeight: 700, padding: "5px 10px", borderRadius: 8, border: "1px solid oklch(0.88 0.006 60)", background: "#fff", cursor: "pointer", opacity: addMemberSelection[sp.id] ? 1 : 0.5 }}
-                            >
-                              Add
-                            </button>
-                          </div>
-                        )}
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  {spaces.map((sp) => (
+                    <div key={sp.id} style={{ display: "flex", alignItems: "center", gap: 12, padding: 12, border: "1px solid oklch(0.91 0.006 60)", borderRadius: 10 }}>
+                      <div style={{ width: 32, height: 32, borderRadius: 8, background: `oklch(0.85 0.08 ${sp.hue})`, color: `oklch(0.3 0.1 ${sp.hue})`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, fontWeight: 800, flex: "none" }}>
+                        {sp.name.charAt(0)}
                       </div>
-                    );
-                  })}
+                      <div style={{ flex: 1, minWidth: 0 }}>
+                        <div style={{ fontSize: 13.5, fontWeight: 700 }}>{sp.name}</div>
+                        <div style={{ fontSize: 11.5, color: MUTED_FG }}>{sp.members.length} members &middot; {sp.lists.flatMap((l) => l.tasks).length} tasks</div>
+                      </div>
+                      <button
+                        onClick={() => setManageSpaceId(sp.id)}
+                        style={{ border: "1px solid oklch(0.88 0.006 60)", background: "#fff", fontSize: 12, fontWeight: 700, padding: "6px 12px", borderRadius: 8, cursor: "pointer", color: "oklch(0.35 0.01 60)" }}
+                      >
+                        Manage
+                      </button>
+                    </div>
+                  ))}
                 </div>
               </div>
 
@@ -1553,12 +2132,7 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
                   {inviteLink && (
                     <div style={{ display: "flex", alignItems: "center", gap: 8, background: "oklch(0.96 0.006 60)", borderRadius: 8, padding: "8px 10px" }}>
                       <div style={{ fontSize: 12, color: "oklch(0.4 0.01 60)", flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{inviteLink}</div>
-                      <button
-                        onClick={() => navigator.clipboard.writeText(inviteLink)}
-                        style={{ fontSize: 12, fontWeight: 700, padding: "4px 10px", borderRadius: 6, border: "1px solid oklch(0.88 0.006 60)", background: "#fff", cursor: "pointer" }}
-                      >
-                        Copy link
-                      </button>
+                      <CopyButton text={inviteLink} style={{ height: "auto", padding: "4px 10px", border: "1px solid oklch(0.88 0.006 60)", background: "#fff", fontSize: 12 }} />
                     </div>
                   )}
                 </div>
@@ -1575,12 +2149,7 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
                         <div style={{ fontSize: 13, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{inv.email}</div>
                         <div style={{ fontSize: 11.5, color: "oklch(0.55 0.01 60)" }}>{inv.role.toLowerCase()}{inv.scope ? ` · ${inv.scope}` : ""}</div>
                       </div>
-                      <button
-                        onClick={() => navigator.clipboard.writeText(inv.url)}
-                        style={{ fontSize: 12, fontWeight: 700, padding: "4px 10px", borderRadius: 6, border: "1px solid oklch(0.88 0.006 60)", background: "#fff", cursor: "pointer" }}
-                      >
-                        Copy link
-                      </button>
+                      <CopyButton text={inv.url} style={{ height: "auto", padding: "4px 10px", border: "1px solid oklch(0.88 0.006 60)", background: "#fff", fontSize: 12 }} />
                       <button
                         onClick={() => revokeInvite(inv.id)}
                         style={{ fontSize: 12, fontWeight: 700, padding: "4px 10px", borderRadius: 6, border: "none", background: "transparent", color: "oklch(0.5 0.15 25)", cursor: "pointer" }}
@@ -1591,6 +2160,127 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
                   ))
                 )}
               </div>
+            </div>
+          )}
+
+          {showSettings && (
+            <div style={{ flex: 1, overflowY: "auto", padding: 24, maxWidth: 640 }}>
+              <div style={{ display: "flex", gap: 16, marginBottom: 20, borderBottom: "1px solid oklch(0.9 0.006 60)" }}>
+                <button
+                  onClick={() => setSettingsTab("profile")}
+                  style={{ padding: "8px 4px", border: "none", borderBottom: `2px solid ${settingsTab === "profile" ? "oklch(0.68 0.16 35)" : "transparent"}`, background: "transparent", fontSize: 13, fontWeight: 700, color: settingsTab === "profile" ? "oklch(0.25 0.01 60)" : MUTED_FG, cursor: "pointer" }}
+                >
+                  Profile
+                </button>
+                <button
+                  onClick={() => setSettingsTab("notifications")}
+                  style={{ padding: "8px 4px", border: "none", borderBottom: `2px solid ${settingsTab === "notifications" ? "oklch(0.68 0.16 35)" : "transparent"}`, background: "transparent", fontSize: 13, fontWeight: 700, color: settingsTab === "notifications" ? "oklch(0.25 0.01 60)" : MUTED_FG, cursor: "pointer" }}
+                >
+                  Notifications
+                </button>
+              </div>
+              {settingsTab === "profile" ? (
+                <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
+                  <div>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: MUTED_FG, marginBottom: 6 }}>Name</div>
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <input
+                        value={profileNameInput}
+                        onChange={(e) => setProfileNameInput(e.target.value)}
+                        style={{ flex: 1, boxSizing: "border-box", border: "1px solid oklch(0.88 0.006 60)", borderRadius: 8, padding: "9px 12px", fontSize: 13.5, fontFamily: "inherit" }}
+                      />
+                      {profileNameInput.trim() !== currentUser.name && (
+                        <button
+                          onClick={handleSaveProfileName}
+                          disabled={!profileNameInput.trim() || savingProfileName}
+                          style={{ border: "none", background: "oklch(0.68 0.16 35)", color: "#fff", fontSize: 12.5, fontWeight: 700, padding: "0 14px", borderRadius: 8, cursor: "pointer", opacity: !profileNameInput.trim() || savingProfileName ? 0.6 : 1 }}
+                        >
+                          Save
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  <div>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: MUTED_FG, marginBottom: 6 }}>Email</div>
+                    <div style={{ fontSize: 13.5, color: "oklch(0.4 0.01 60)", padding: "9px 12px", background: "oklch(0.97 0.006 60)", borderRadius: 8 }}>{currentUserEmail}</div>
+                  </div>
+                  <div>
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                      <div style={{ fontSize: 12, fontWeight: 700, color: MUTED_FG }}>Password</div>
+                      <button
+                        onClick={() => {
+                          setPasswordFormOpen((v) => !v);
+                          setPasswordError(null);
+                        }}
+                        style={{ border: "none", background: "transparent", color: "oklch(0.5 0.14 240)", fontSize: 12.5, fontWeight: 700, cursor: "pointer" }}
+                      >
+                        {passwordFormOpen ? "Cancel" : "Change password"}
+                      </button>
+                    </div>
+                    {passwordFormOpen && (
+                      <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 8 }}>
+                        <input
+                          type="password"
+                          value={currentPasswordInput}
+                          onChange={(e) => setCurrentPasswordInput(e.target.value)}
+                          placeholder="Current password"
+                          style={{ boxSizing: "border-box", border: "1px solid oklch(0.88 0.006 60)", borderRadius: 8, padding: "9px 12px", fontSize: 13.5, fontFamily: "inherit" }}
+                        />
+                        <input
+                          type="password"
+                          value={newPasswordInput}
+                          onChange={(e) => setNewPasswordInput(e.target.value)}
+                          placeholder="New password"
+                          style={{ boxSizing: "border-box", border: "1px solid oklch(0.88 0.006 60)", borderRadius: 8, padding: "9px 12px", fontSize: 13.5, fontFamily: "inherit" }}
+                        />
+                        <input
+                          type="password"
+                          value={confirmPasswordInput}
+                          onChange={(e) => setConfirmPasswordInput(e.target.value)}
+                          placeholder="Confirm new password"
+                          style={{ boxSizing: "border-box", border: "1px solid oklch(0.88 0.006 60)", borderRadius: 8, padding: "9px 12px", fontSize: 13.5, fontFamily: "inherit" }}
+                        />
+                        {passwordError && (
+                          <div style={{ fontSize: 12.5, fontWeight: 600, color: "oklch(0.5 0.18 25)", background: "oklch(0.95 0.05 25)", borderRadius: 8, padding: "8px 12px" }}>
+                            {passwordError}
+                          </div>
+                        )}
+                        <button
+                          onClick={handleChangePassword}
+                          disabled={!currentPasswordInput || !newPasswordInput || savingPassword}
+                          style={{ alignSelf: "flex-start", border: "none", background: "oklch(0.68 0.16 35)", color: "#fff", fontSize: 12.5, fontWeight: 700, padding: "8px 14px", borderRadius: 8, cursor: "pointer", opacity: !currentPasswordInput || !newPasswordInput || savingPassword ? 0.6 : 1 }}
+                        >
+                          Update password
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ) : (
+                <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
+                  {["Tasks", "Chat"].map((group) => (
+                    <div key={group}>
+                      <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.55 0.01 60)", textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: 8 }}>{group}</div>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                        {NOTIF_PREF_DEFS.filter((d) => d.group === group).map((pr) => {
+                          const on = notifPrefs[pr.key];
+                          return (
+                            <div key={pr.key} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 4px" }}>
+                              <div style={{ fontSize: 13.5, color: "oklch(0.28 0.01 60)" }}>{pr.label}</div>
+                              <button
+                                onClick={() => handleToggleNotifPref(pr.key)}
+                                style={{ width: 40, height: 22, borderRadius: 999, border: "none", background: on ? "oklch(0.68 0.16 35)" : "oklch(0.88 0.006 60)", position: "relative", cursor: "pointer", flex: "none" }}
+                              >
+                                <div style={{ position: "absolute", top: 2, left: on ? 18 : 2, width: 18, height: 18, borderRadius: "50%", background: "#fff", boxShadow: "0 1px 2px oklch(0 0 0 / 0.2)", transition: "left 0.12s" }} />
+                              </button>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -1605,10 +2295,6 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
           <button onClick={() => selectContext("chat")} style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 2, border: "none", background: "transparent", cursor: "pointer", color: navColor("chat") }}>
             <div style={{ width: 18, height: 16, borderRadius: "5px 5px 5px 1px", border: "2px solid currentColor" }} />
             <div style={{ fontSize: 10, fontWeight: 600 }}>Chat</div>
-          </button>
-          <button onClick={() => selectContext("notifications")} style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 2, border: "none", background: "transparent", cursor: "pointer", color: navColor("notifications") }}>
-            <div style={{ width: 16, height: 16, borderRadius: "50% 50% 8px 8px", border: "2px solid currentColor" }} />
-            <div style={{ fontSize: 10, fontWeight: 600 }}>Alerts</div>
           </button>
           <button onClick={toggleDrawer} style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 2, border: "none", background: "transparent", cursor: "pointer", color: "oklch(0.4 0.01 60)" }}>
             <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
@@ -1630,24 +2316,36 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
                 &times;
               </button>
             </div>
+            <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.5 0.01 60)", letterSpacing: "0.04em", padding: "0 8px" }}>{workspaceName.toUpperCase()}</div>
             <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
               <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.55 0.01 60)", textTransform: "uppercase", letterSpacing: "0.04em", padding: "0 8px 4px" }}>Spaces</div>
               {spaceRows.map((sp) => (
-                <button
-                  key={sp.id}
-                  onClick={() => selectSpace(sp.id)}
-                  style={{ display: "flex", alignItems: "center", gap: 10, padding: 8, border: "none", borderRadius: 8, cursor: "pointer", textAlign: "left", background: sp.rowBg }}
-                >
-                  <div style={{ width: 26, height: 26, borderRadius: 7, background: `oklch(0.85 0.08 ${sp.hue})`, color: `oklch(0.3 0.1 ${sp.hue})`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 800, flex: "none" }}>
-                    {sp.initial}
-                  </div>
-                  <div style={{ display: "flex", flexDirection: "column", minWidth: 0 }}>
-                    <div style={{ fontSize: 13, fontWeight: 700, color: sp.rowColor }}>{sp.name}</div>
-                    <div style={{ fontSize: 11.5, color: "oklch(0.5 0.01 60)" }}>{sp.listLabel}</div>
-                  </div>
-                </button>
+                <div key={sp.id} style={{ display: "flex", alignItems: "center", borderRadius: 8, background: sp.rowBg }}>
+                  <button
+                    onClick={() => selectSpace(sp.id)}
+                    style={{ display: "flex", alignItems: "center", gap: 10, padding: 8, border: "none", background: "transparent", borderRadius: 8, cursor: "pointer", textAlign: "left", flex: 1, minWidth: 0 }}
+                  >
+                    <div style={{ width: 26, height: 26, borderRadius: 7, background: `oklch(0.85 0.08 ${sp.hue})`, color: `oklch(0.3 0.1 ${sp.hue})`, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, fontWeight: 800, flex: "none" }}>
+                      {sp.initial}
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", minWidth: 0 }}>
+                      <div style={{ fontSize: 13, fontWeight: 700, color: sp.rowColor }}>{sp.name}</div>
+                      <div style={{ fontSize: 11.5, color: "oklch(0.5 0.01 60)" }}>{sp.listLabel}</div>
+                    </div>
+                  </button>
+                  {canManage && (
+                    <button
+                      onClick={() => openSpaceSettings(sp.id)}
+                      title="Space settings"
+                      style={{ flex: "none", width: 24, height: 24, marginRight: 4, border: "none", background: "transparent", borderRadius: 6, cursor: "pointer", color: "oklch(0.55 0.01 60)", fontSize: 14 }}
+                    >
+                      &#8942;
+                    </button>
+                  )}
+                </div>
               ))}
             </div>
+            {chatSidebarSection}
           </div>
           <div style={{ flex: 1 }} onClick={toggleDrawer} />
         </div>
@@ -1661,8 +2359,31 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
             ) : (
               <>
                 <div style={{ display: "flex", alignItems: "flex-start", gap: 12 }}>
-                  <div style={{ flex: 1, fontSize: 17, fontWeight: 700, lineHeight: 1.35 }}>{selectedTask.title}</div>
+                  <div style={{ flex: 1, minWidth: 0, display: "flex", flexDirection: "column", gap: 4 }}>
+                    {!isGuest && taskEditMode ? (
+                      <input
+                        key={selectedTask.id}
+                        defaultValue={selectedTask.title}
+                        onBlur={(e) => handleSaveTitle(selectedTask.id, e.target.value)}
+                        disabled={savingField === "title"}
+                        style={{ width: "100%", boxSizing: "border-box", fontSize: 17, fontWeight: 700, lineHeight: 1.35, border: "1px solid oklch(0.6 0.14 240)", borderRadius: 8, padding: "4px 6px", fontFamily: "inherit" }}
+                      />
+                    ) : (
+                      <div style={{ fontSize: 17, fontWeight: 700, lineHeight: 1.35 }}>{selectedTask.title}</div>
+                    )}
+                    <div style={{ fontSize: 11.5, color: MUTED_FG }}>Opened by {selectedTask.createdBy.name}</div>
+                  </div>
                   {!isGuest && (
+                    <button
+                      onClick={() => setTaskEditMode((v) => !v)}
+                      title={taskEditMode ? "Done editing" : "Edit task"}
+                      style={{ border: "none", background: taskEditMode ? "oklch(0.68 0.16 35)" : "oklch(0.95 0.006 60)", color: taskEditMode ? "#fff" : "inherit", padding: "0 10px", height: 30, borderRadius: 8, fontSize: 11.5, fontWeight: 700, cursor: "pointer", flex: "none" }}
+                    >
+                      {taskEditMode ? "Done" : "Edit"}
+                    </button>
+                  )}
+                  <CopyButton text={`${typeof window !== "undefined" ? window.location.origin + window.location.pathname : ""}?task=${selectedTask.id}`} label="Copy link" />
+                  {!isGuest && taskEditMode && (
                     <button
                       onClick={() => handleDeleteTask(selectedTask.id)}
                       title="Delete task"
@@ -1682,12 +2403,12 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
                 )}
                 <div>
                   <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.55 0.01 60)", textTransform: "uppercase", letterSpacing: "0.03em", marginBottom: 6 }}>Assignees</div>
-                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: isGuest ? 0 : 6 }}>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6, marginBottom: !isGuest && taskEditMode ? 6 : 0 }}>
                     {selectedTask.assignees.map((a) => (
                       <div key={a.id} style={{ display: "flex", alignItems: "center", gap: 6, background: "oklch(0.96 0.006 60)", borderRadius: 999, padding: "3px 6px 3px 3px" }}>
                         <AvatarCircle a={a} size={20} fontSize={9} />
                         <span style={{ fontSize: 12, fontWeight: 600 }}>{a.name}</span>
-                        {!isGuest && (
+                        {!isGuest && taskEditMode && (
                           <button
                             onClick={() => handleRemoveAssignee(selectedTask.id, a.id)}
                             disabled={savingField === "assignee"}
@@ -1700,7 +2421,7 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
                     ))}
                     {selectedTask.assignees.length === 0 && <span style={{ fontSize: 12.5, color: MUTED_FG }}>Unassigned</span>}
                   </div>
-                  {!isGuest && (() => {
+                  {!isGuest && taskEditMode && (() => {
                     const addable = spaceMembers.filter((m) => !selectedTask.assignees.some((a) => a.id === m.id));
                     return addable.length > 0 ? (
                       <select
@@ -1720,7 +2441,7 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, padding: 14, background: "oklch(0.98 0.004 60)", borderRadius: 10 }}>
                   <div>
                     <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.55 0.01 60)", textTransform: "uppercase", letterSpacing: "0.03em", marginBottom: 4 }}>Priority</div>
-                    {isGuest ? (
+                    {isGuest || !taskEditMode ? (
                       <span style={{ fontSize: 11, fontWeight: 700, padding: "2px 9px", borderRadius: 999, background: PRIORITY[selectedTask.priority].bg, color: PRIORITY[selectedTask.priority].fg }}>{PRIORITY[selectedTask.priority].label}</span>
                     ) : (
                       <select
@@ -1737,7 +2458,7 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
                   </div>
                   <div>
                     <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.55 0.01 60)", textTransform: "uppercase", letterSpacing: "0.03em", marginBottom: 4 }}>Due date</div>
-                    {isGuest ? (
+                    {isGuest || !taskEditMode ? (
                       <div style={{ fontSize: 13, fontWeight: 600 }}>{selectedTask.due}</div>
                     ) : (
                       <input
@@ -1752,7 +2473,7 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
                   </div>
                   <div>
                     <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.55 0.01 60)", textTransform: "uppercase", letterSpacing: "0.03em", marginBottom: 4 }}>Status</div>
-                    {isGuest ? (
+                    {isGuest || !taskEditMode ? (
                       <div style={{ fontSize: 13, fontWeight: 600 }}>{STATUSES.find((s) => s.key === selectedTask.status)!.label}</div>
                     ) : (
                       <select
@@ -1771,7 +2492,7 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
                 <div>
                   <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 6 }}>
                     <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.55 0.01 60)", textTransform: "uppercase", letterSpacing: "0.03em" }}>Description</div>
-                    {!isGuest && editingDescTaskId !== selectedTask.id && (
+                    {!isGuest && taskEditMode && editingDescTaskId !== selectedTask.id && (
                       <button
                         onClick={() => setEditingDescTaskId(selectedTask.id)}
                         style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.68 0.16 35)", background: "none", border: "none", cursor: "pointer", padding: 0 }}
@@ -1780,7 +2501,7 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
                       </button>
                     )}
                   </div>
-                  {isGuest || editingDescTaskId !== selectedTask.id ? (
+                  {isGuest || !taskEditMode || editingDescTaskId !== selectedTask.id ? (
                     selectedTask.desc ? (
                       <Markdown text={selectedTask.desc} />
                     ) : (
@@ -1802,19 +2523,104 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
                     />
                   )}
                 </div>
-                {selectedTask.checklist && (
-                  <div>
-                    <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 8 }}>
-                      <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.55 0.01 60)", textTransform: "uppercase", letterSpacing: "0.03em" }}>Checklist</div>
-                      <div style={{ fontSize: 11.5, color: "oklch(0.55 0.01 60)" }}>
-                        {selectedTask.checklist.done}/{selectedTask.checklist.total}
+                <div>
+                  {(() => {
+                    const done = selectedTask.checklist.filter((c) => c.done).length;
+                    const total = selectedTask.checklist.length;
+                    return (
+                      <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 8 }}>
+                        <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.55 0.01 60)", textTransform: "uppercase", letterSpacing: "0.03em" }}>Checklist</div>
+                        {total > 0 && <div style={{ fontSize: 11.5, color: "oklch(0.55 0.01 60)" }}>{done}/{total}</div>}
+                      </div>
+                    );
+                  })()}
+                  {selectedTask.checklist.length > 0 && (
+                    <div style={{ height: 6, borderRadius: 999, background: "oklch(0.92 0.006 60)", overflow: "hidden", marginBottom: 8 }}>
+                      <div
+                        style={{
+                          height: "100%",
+                          background: "oklch(0.68 0.16 35)",
+                          width: `${Math.round((selectedTask.checklist.filter((c) => c.done).length / selectedTask.checklist.length) * 100)}%`,
+                        }}
+                      />
+                    </div>
+                  )}
+                  <div style={{ display: "flex", flexDirection: "column", gap: 4, marginBottom: isGuest ? 0 : 6 }}>
+                    {selectedTask.checklist.map((item) => (
+                      <div key={item.id} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                        <input
+                          type="checkbox"
+                          checked={item.done}
+                          disabled={isGuest}
+                          onChange={(e) => handleToggleChecklistItem(item.id, e.target.checked)}
+                          style={{ cursor: isGuest ? "default" : "pointer" }}
+                        />
+                        <span style={{ flex: 1, fontSize: 12.5, color: item.done ? MUTED_FG : "oklch(0.3 0.01 60)", textDecoration: item.done ? "line-through" : "none" }}>
+                          {item.text}
+                        </span>
+                        {!isGuest && (
+                          <button onClick={() => handleDeleteChecklistItem(item.id)} style={{ border: "none", background: "none", cursor: "pointer", color: MUTED_FG, fontSize: 13, flex: "none" }}>
+                            &times;
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                    {selectedTask.checklist.length === 0 && <div style={{ fontSize: 12.5, color: MUTED_FG }}>No checklist items.</div>}
+                  </div>
+                  {!isGuest && (
+                    <input
+                      value={newChecklistText}
+                      onChange={(e) => setNewChecklistText(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") handleAddChecklistItem(selectedTask.id);
+                      }}
+                      placeholder="+ Add checklist item"
+                      style={{ width: "100%", fontSize: 12.5, padding: "6px 8px", borderRadius: 8, border: "1px solid oklch(0.88 0.006 60)", fontFamily: "inherit" }}
+                    />
+                  )}
+                </div>
+                {(() => {
+                  const currentList = listById.get(selectedTask.listId);
+                  if (!currentList || currentList.customFields.length === 0) return null;
+                  return (
+                    <div>
+                      <div style={{ fontSize: 11, fontWeight: 700, color: "oklch(0.55 0.01 60)", textTransform: "uppercase", letterSpacing: "0.03em", marginBottom: 8 }}>Custom fields</div>
+                      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                        {currentList.customFields.map((field) => {
+                          const value = selectedTask.customFieldValues.find((v) => v.fieldId === field.id)?.value ?? "";
+                          return (
+                            <div key={field.id} style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                              <div style={{ width: 100, flex: "none", fontSize: 12.5, fontWeight: 600, color: "oklch(0.4 0.01 60)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                                {field.name}
+                              </div>
+                              {isGuest || !taskEditMode ? (
+                                <div style={{ flex: 1, fontSize: 12.5 }}>{value || <span style={{ color: MUTED_FG }}>—</span>}</div>
+                              ) : field.type === "DROPDOWN" ? (
+                                <select
+                                  value={value}
+                                  onChange={(e) => handleSetCustomFieldValue(selectedTask.id, field.id, e.target.value)}
+                                  style={{ flex: 1, fontSize: 12.5, padding: "4px 8px", borderRadius: 8, border: "1px solid oklch(0.88 0.006 60)", background: "#fff", fontFamily: "inherit", cursor: "pointer" }}
+                                >
+                                  <option value="">—</option>
+                                  {field.options.map((o) => (
+                                    <option key={o} value={o}>{o}</option>
+                                  ))}
+                                </select>
+                              ) : (
+                                <CustomFieldValueEditor
+                                  key={`${selectedTask.id}:${field.id}`}
+                                  type={field.type}
+                                  value={value}
+                                  onSave={(v) => handleSetCustomFieldValue(selectedTask.id, field.id, v)}
+                                />
+                              )}
+                            </div>
+                          );
+                        })}
                       </div>
                     </div>
-                    <div style={{ height: 6, borderRadius: 999, background: "oklch(0.92 0.006 60)", overflow: "hidden" }}>
-                      <div style={{ height: "100%", background: "oklch(0.68 0.16 35)", width: `${selectedTask.checklist.total ? Math.round((selectedTask.checklist.done / selectedTask.checklist.total) * 100) : 0}%` }} />
-                    </div>
-                  </div>
-                )}
+                  );
+                })()}
                 {(() => {
                   const dependencyCandidates = tasksInSpace.filter(
                     (t) => t.id !== selectedTask.id && !selectedTask.dependsOn.some((d) => d.id === t.id)
@@ -1829,7 +2635,7 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
                             <button onClick={() => openTask(d.id)} style={{ flex: 1, minWidth: 0, textAlign: "left", border: "none", background: "none", cursor: "pointer", padding: 0, fontSize: 12.5, fontWeight: 600, color: "oklch(0.3 0.01 60)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
                               {d.title}
                             </button>
-                            {!isGuest && (
+                            {!isGuest && taskEditMode && (
                               <button onClick={() => handleRemoveDependency(selectedTask.id, d.id)} style={{ border: "none", background: "none", cursor: "pointer", color: MUTED_FG, fontSize: 13, flex: "none" }}>
                                 &times;
                               </button>
@@ -1838,7 +2644,7 @@ export default function RallyApp({ currentUser, isGuestRole, role, spaces, share
                         ))}
                         {selectedTask.dependsOn.length === 0 && <div style={{ fontSize: 12.5, color: MUTED_FG }}>Not blocked by anything.</div>}
                       </div>
-                      {!isGuest && dependencyCandidates.length > 0 && (
+                      {!isGuest && taskEditMode && dependencyCandidates.length > 0 && (
                         <select
                           value=""
                           onChange={(e) => e.target.value && handleAddDependency(selectedTask.id, e.target.value)}

@@ -1,7 +1,7 @@
 import { redirect } from "next/navigation";
 import { auth } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
-import RallyApp, { type UiAvatar, type UiChannel, type UiInvite, type UiList, type UiMember, type UiNotification, type UiSpace, type PriorityKey, type StatusKey, type RoleKey } from "./RallyApp";
+import RallyApp, { type UiAvatar, type UiChannel, type UiCustomField, type UiInvite, type UiList, type UiMember, type UiNotification, type UiSpace, type PriorityKey, type StatusKey, type RoleKey } from "./RallyApp";
 
 const STATUS_MAP: Record<string, StatusKey> = {
   TODO: "todo",
@@ -54,6 +54,7 @@ function toAvatar(u: { id: string; name: string | null; email: string }): UiAvat
 
 type TaskWithRelations = {
   id: string;
+  listId: string;
   title: string;
   description: string | null;
   status: string;
@@ -66,11 +67,14 @@ type TaskWithRelations = {
   attachments: { id: string; filename: string; mimeType: string; size: number; createdAt: Date; uploadedBy: { id: string; name: string | null; email: string } }[];
   dependsOn: { dependsOn: { id: string; title: string; status: string } }[];
   dependents: { task: { id: string; title: string; status: string } }[];
+  checklistItems: { id: string; text: string; done: boolean }[];
+  customFieldValues: { customFieldId: string; value: string }[];
 };
 
 function toUiTask(t: TaskWithRelations) {
   return {
     id: t.id,
+    listId: t.listId,
     title: t.title,
     desc: t.description ?? "",
     status: STATUS_MAP[t.status] ?? "todo",
@@ -78,7 +82,9 @@ function toUiTask(t: TaskWithRelations) {
     due: t.dueDate ? dueFormatter.format(t.dueDate) : "No due date",
     dueDate: t.dueDate ? t.dueDate.toISOString().slice(0, 10) : null,
     assignees: t.assignees.map(toAvatar),
-    checklist: t.subtasks.length ? { done: t.subtasks.filter((s) => s.status === "DONE").length, total: t.subtasks.length } : null,
+    createdBy: toAvatar(t.createdBy),
+    checklist: t.checklistItems.map((c) => ({ id: c.id, text: c.text, done: c.done })),
+    customFieldValues: t.customFieldValues.map((v) => ({ fieldId: v.customFieldId, value: v.value })),
     comments: t.comments.map((c) => ({ id: c.id, author: toAvatar(c.author), body: c.body, time: timeAgo(c.createdAt) })),
     attachments: t.attachments.map((a) => ({ id: a.id, filename: a.filename, mimeType: a.mimeType, size: a.size, uploadedBy: toAvatar(a.uploadedBy), time: timeAgo(a.createdAt) })),
     dependsOn: t.dependsOn.map((d) => ({ id: d.dependsOn.id, title: d.dependsOn.title, status: STATUS_MAP[d.dependsOn.status] ?? "todo" })),
@@ -94,7 +100,13 @@ const taskInclude = {
   attachments: { orderBy: { createdAt: "asc" }, include: { uploadedBy: { select: { id: true, name: true, email: true } } } },
   dependsOn: { include: { dependsOn: { select: { id: true, title: true, status: true } } } },
   dependents: { include: { task: { select: { id: true, title: true, status: true } } } },
+  checklistItems: { orderBy: { position: "asc" }, select: { id: true, text: true, done: true } },
+  customFieldValues: { select: { customFieldId: true, value: true } },
 } as const;
+
+function toUiCustomField(f: { id: string; name: string; type: string; options: string[] }): UiCustomField {
+  return { id: f.id, name: f.name, type: f.type as UiCustomField["type"], options: f.options };
+}
 
 export default async function Page() {
   const session = await auth();
@@ -116,6 +128,9 @@ export default async function Page() {
 
   const isGuestRole = membership.role === "GUEST";
   const currentUser = toAvatar({ id: session.user.id, name: session.user.name ?? null, email: session.user.email ?? "" });
+
+  const me = await prisma.user.findUnique({ where: { id: session.user.id }, select: { notificationPrefs: true } });
+  const notificationPrefs = (me?.notificationPrefs as Record<string, boolean> | null) ?? null;
 
   const notificationsRaw = await prisma.notification.findMany({
     where: { userId: session.user.id },
@@ -140,7 +155,10 @@ export default async function Page() {
   if (isGuestRole) {
     const lists = await prisma.list.findMany({
       where: { guestShares: { some: { userId: session.user.id } } },
-      include: { tasks: { orderBy: { position: "asc" }, where: { parentId: null }, include: taskInclude } },
+      include: {
+        tasks: { orderBy: { position: "asc" }, where: { parentId: null }, include: taskInclude },
+        customFields: { orderBy: { position: "asc" } },
+      },
     });
 
     const sharedLists: UiList[] = lists.map((l) => ({
@@ -150,12 +168,15 @@ export default async function Page() {
       sprintStart: toDateStr(l.sprintStart),
       sprintEnd: toDateStr(l.sprintEnd),
       tasks: l.tasks.map((t) => toUiTask(t)),
+      customFields: l.customFields.map(toUiCustomField),
     }));
 
     return (
       <RallyApp
         workspaceName={membership.workspace.name}
         currentUser={currentUser}
+        currentUserEmail={session.user.email ?? ""}
+        notificationPrefs={notificationPrefs}
         isGuestRole
         role="GUEST"
         spaces={[]}
@@ -177,16 +198,20 @@ export default async function Page() {
     include: {
       messages: { orderBy: { createdAt: "asc" }, include: { author: { select: { id: true, name: true, email: true } } } },
       members: { select: { id: true, name: true, email: true } },
+      reads: { where: { userId: session.user.id }, select: { lastReadAt: true } },
     },
     orderBy: { createdAt: "asc" },
   });
 
   const channels: UiChannel[] = channelsRaw.map((c) => {
     const otherMember = c.isDirect ? c.members.find((m) => m.id !== session.user.id) : undefined;
+    const lastReadAt = c.reads[0]?.lastReadAt ?? c.createdAt;
+    const unread = c.messages.filter((m) => m.authorId !== session.user.id && m.createdAt > lastReadAt).length;
     return {
       id: c.id,
       name: c.isDirect ? (otherMember ? (otherMember.name ?? otherMember.email) : "Direct message") : c.name ?? "channel",
       isDirect: c.isDirect,
+      unread,
       members: c.members.map(toAvatar),
       messages: c.messages.map((m) => ({
         id: m.id,
@@ -208,7 +233,10 @@ export default async function Page() {
     where: role === "OWNER" ? { workspaceId: membership.workspaceId } : { workspaceId: membership.workspaceId, members: { some: { userId: session.user.id } } },
     include: {
       lists: {
-        include: { tasks: { orderBy: { position: "asc" }, where: { parentId: null }, include: taskInclude } },
+        include: {
+          tasks: { orderBy: { position: "asc" }, where: { parentId: null }, include: taskInclude },
+          customFields: { orderBy: { position: "asc" } },
+        },
       },
       members: { include: { user: { select: { id: true, name: true, email: true } } } },
     },
@@ -230,6 +258,7 @@ export default async function Page() {
         sprintStart: toDateStr(l.sprintStart),
         sprintEnd: toDateStr(l.sprintEnd),
         tasks: l.tasks.map((t) => toUiTask(t)),
+        customFields: l.customFields.map(toUiCustomField),
       })),
     };
   });
@@ -255,6 +284,8 @@ export default async function Page() {
     <RallyApp
       workspaceName={membership.workspace.name}
       currentUser={currentUser}
+      currentUserEmail={session.user.email ?? ""}
+      notificationPrefs={notificationPrefs}
       isGuestRole={false}
       role={role}
       spaces={spaces}

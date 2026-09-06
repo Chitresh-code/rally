@@ -5,7 +5,7 @@ export default auth((req) => {
   const isLoggedIn = !!req.auth;
   const { pathname } = req.nextUrl;
   const isLoginPage = pathname === "/login";
-  const isPublicPage = isLoginPage || pathname.startsWith("/invite/");
+  const isPublicPage = isLoginPage || pathname.startsWith("/invite/") || pathname.startsWith("/api/cron/");
 
   if (!isLoggedIn && !isPublicPage) {
     return NextResponse.redirect(new URL("/login", req.nextUrl.origin));

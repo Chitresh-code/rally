@@ -4,6 +4,7 @@ import crypto from "crypto";
 import { revalidatePath } from "next/cache";
 import bcrypt from "bcryptjs";
 import { auth } from "@/lib/auth";
+import { requireEditableTask, requireListAccess } from "@/lib/access";
 import { prisma } from "@/lib/prisma";
 import { sendMail } from "@/lib/mailer";
 import { mentionedUserIds } from "@/lib/mentions";
@@ -13,17 +14,23 @@ async function myMembership(userId: string) {
   return prisma.userMembership.findFirst({ where: { userId } });
 }
 
-async function notify(userId: string, actorId: string, text: string, taskId?: string) {
-  if (userId === actorId) return;
-  await prisma.notification.create({ data: { userId, text, taskId } });
+type NotifCategory = "taskAssigned" | "taskDue" | "comments" | "chatMentions";
 
-  const user = await prisma.user.findUnique({ where: { id: userId }, select: { email: true, name: true } });
+async function notify(userId: string, actorId: string | null, text: string, taskId?: string, category?: NotifCategory) {
+  if (actorId && userId === actorId) return;
+
+  const user = await prisma.user.findUnique({ where: { id: userId }, select: { email: true, name: true, notificationPrefs: true } });
   if (!user) return;
+  const prefs = user.notificationPrefs as Record<string, boolean> | null;
+  const enabled = !category || !prefs || prefs[category] !== false;
 
-  try {
-    await sendMail(user.email, "Rally notification", `${text}\n\n${process.env.APP_URL ?? "http://localhost:3000"}`);
-  } catch (err) {
-    console.error("Failed to send notification email", err);
+  if (enabled) {
+    await prisma.notification.create({ data: { userId, text, taskId } });
+    try {
+      await sendMail(user.email, "Rally notification", `${text}\n\n${process.env.APP_URL ?? "http://localhost:3000"}`);
+    } catch (err) {
+      console.error("Failed to send notification email", err);
+    }
   }
 
   // ponytail: incoming webhooks post to one fixed Slack channel, so this is
@@ -45,38 +52,45 @@ async function notify(userId: string, actorId: string, text: string, taskId?: st
   }
 }
 
+// Called hourly by /api/cron/due-notifications, which only lets it run through
+// once at the DUE_NOTIFY_HOUR gate (see that route) — the createdAt check below
+// is a cheap belt-and-suspenders dedupe, not the primary guard.
+export async function checkDueDateNotifications() {
+  const now = new Date();
+  const todayStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+  const tomorrowStart = new Date(todayStart.getTime() + 86_400_000);
+  const dayAfterStart = new Date(tomorrowStart.getTime() + 86_400_000);
+
+  const windows = [
+    { label: "due today", gte: todayStart, lt: tomorrowStart },
+    { label: "due tomorrow", gte: tomorrowStart, lt: dayAfterStart },
+  ];
+
+  for (const { label, gte, lt } of windows) {
+    const tasks = await prisma.task.findMany({
+      where: { dueDate: { gte, lt }, status: { not: "DONE" } },
+      include: { assignees: { select: { id: true } } },
+    });
+    for (const task of tasks) {
+      const text = `'${task.title}' is ${label}`;
+      for (const assignee of task.assignees) {
+        const alreadySent = await prisma.notification.findFirst({
+          where: { userId: assignee.id, taskId: task.id, text, createdAt: { gte: todayStart } },
+        });
+        if (!alreadySent) await notify(assignee.id, null, text, task.id, "taskDue");
+      }
+    }
+  }
+}
+
 async function filterWorkspaceMembers(workspaceId: string, ids: string[]): Promise<string[]> {
   if (ids.length === 0) return [];
   const rows = await prisma.userMembership.findMany({ where: { workspaceId, userId: { in: ids } }, select: { userId: true } });
   return rows.map((r) => r.userId);
 }
 
-export async function assertListAccess(userId: string, listId: string) {
-  const list = await prisma.list.findUnique({
-    where: { id: listId },
-    include: {
-      space: { include: { members: { where: { userId } } } },
-      guestShares: { where: { userId } },
-    },
-  });
-  if (!list) throw new Error("List not found");
-
-  const membership = await prisma.userMembership.findUnique({
-    where: { userId_workspaceId: { userId, workspaceId: list.space.workspaceId } },
-  });
-
-  if (!membership) {
-    if (list.guestShares.length > 0) return { isGuest: true };
-    throw new Error("Forbidden");
-  }
-  if (membership.role === "GUEST") {
-    if (list.guestShares.length === 0) throw new Error("Forbidden");
-    return { isGuest: true };
-  }
-  if (membership.role === "OWNER") return { isGuest: false };
-
-  if (list.space.members.length === 0) throw new Error("Forbidden");
-  return { isGuest: false };
+async function assertListAccess(userId: string, listId: string) {
+  return requireListAccess(userId, listId);
 }
 
 export async function createTask(listId: string, title: string) {
@@ -85,7 +99,7 @@ export async function createTask(listId: string, title: string) {
   const trimmed = title.trim();
   if (!trimmed) return;
 
-  const { isGuest } = await assertListAccess(session.user.id, listId);
+  const { isGuest } = await requireListAccess(session.user.id, listId);
   if (isGuest) throw new Error("Guests cannot create tasks");
 
   await prisma.task.create({
@@ -216,7 +230,7 @@ export async function createInvite(input: { email: string; role: "ADMIN" | "MEMB
     await assertManagesSpace(session.user.id, membership.role, input.spaceId);
   } else if (input.role === "GUEST") {
     if (!input.listId) throw new Error("A list is required to invite a guest");
-    await assertListAccess(session.user.id, input.listId);
+    await requireListAccess(session.user.id, input.listId);
   }
 
   const token = crypto.randomBytes(32).toString("hex");
@@ -307,16 +321,13 @@ const STATUS_DB = { todo: "TODO", in_progress: "IN_PROGRESS", review: "IN_REVIEW
 const PRIORITY_DB = { low: "LOW", normal: "MEDIUM", high: "HIGH", urgent: "URGENT" } as const;
 
 async function assertCanEditTask(userId: string, taskId: string) {
-  const task = await prisma.task.findUnique({ where: { id: taskId }, select: { listId: true } });
-  if (!task) throw new Error("Task not found");
-  const { isGuest } = await assertListAccess(userId, task.listId);
-  if (isGuest) throw new Error("Guests cannot edit tasks");
+  await requireEditableTask(userId, taskId);
 }
 
 export async function updateTaskStatus(taskId: string, status: keyof typeof STATUS_DB) {
   const session = await auth();
   if (!session?.user?.id) return;
-  await assertCanEditTask(session.user.id, taskId);
+  await requireEditableTask(session.user.id, taskId);
   await prisma.task.update({ where: { id: taskId }, data: { status: STATUS_DB[status] } });
   revalidatePath("/");
 }
@@ -350,7 +361,7 @@ export async function addTaskAssignee(taskId: string, userId: string) {
 
   await prisma.task.update({ where: { id: taskId }, data: { assignees: { connect: [{ id: userId }] } } });
   const actor = session.user.name ?? session.user.email ?? "Someone";
-  await notify(userId, session.user.id, `${actor} assigned you to '${task.title}'`, taskId);
+  await notify(userId, session.user.id, `${actor} assigned you to '${task.title}'`, taskId, "taskAssigned");
   revalidatePath("/");
 }
 
@@ -359,6 +370,81 @@ export async function removeTaskAssignee(taskId: string, userId: string) {
   if (!session?.user?.id) return;
   await assertCanEditTask(session.user.id, taskId);
   await prisma.task.update({ where: { id: taskId }, data: { assignees: { disconnect: [{ id: userId }] } } });
+  revalidatePath("/");
+}
+
+export async function addChecklistItem(taskId: string, text: string) {
+  const session = await auth();
+  if (!session?.user?.id) return;
+  const trimmed = text.trim();
+  if (!trimmed) return;
+  await assertCanEditTask(session.user.id, taskId);
+
+  const count = await prisma.checklistItem.count({ where: { taskId } });
+  await prisma.checklistItem.create({ data: { taskId, text: trimmed, position: count } });
+  revalidatePath("/");
+}
+
+export async function toggleChecklistItem(itemId: string, done: boolean) {
+  const session = await auth();
+  if (!session?.user?.id) return;
+  const item = await prisma.checklistItem.findUnique({ where: { id: itemId }, select: { taskId: true } });
+  if (!item) throw new Error("Checklist item not found");
+  await assertCanEditTask(session.user.id, item.taskId);
+  await prisma.checklistItem.update({ where: { id: itemId }, data: { done } });
+  revalidatePath("/");
+}
+
+export async function deleteChecklistItem(itemId: string) {
+  const session = await auth();
+  if (!session?.user?.id) return;
+  const item = await prisma.checklistItem.findUnique({ where: { id: itemId }, select: { taskId: true } });
+  if (!item) return;
+  await assertCanEditTask(session.user.id, item.taskId);
+  await prisma.checklistItem.delete({ where: { id: itemId } });
+  revalidatePath("/");
+}
+
+export async function createCustomField(listId: string, name: string, type: "TEXT" | "NUMBER" | "DATE" | "DROPDOWN", options: string[]) {
+  const session = await auth();
+  if (!session?.user?.id) return;
+  const trimmed = name.trim();
+  if (!trimmed) return;
+  const { isGuest } = await assertListAccess(session.user.id, listId);
+  if (isGuest) throw new Error("Guests cannot add custom fields");
+
+  const count = await prisma.customField.count({ where: { listId } });
+  await prisma.customField.create({
+    data: { listId, name: trimmed, type, options: type === "DROPDOWN" ? options.filter(Boolean) : [], position: count },
+  });
+  revalidatePath("/");
+}
+
+export async function deleteCustomField(fieldId: string) {
+  const session = await auth();
+  if (!session?.user?.id) return;
+  const field = await prisma.customField.findUnique({ where: { id: fieldId }, select: { listId: true } });
+  if (!field) return;
+  const { isGuest } = await assertListAccess(session.user.id, field.listId);
+  if (isGuest) throw new Error("Guests cannot delete custom fields");
+  await prisma.customField.delete({ where: { id: fieldId } });
+  revalidatePath("/");
+}
+
+export async function setCustomFieldValue(taskId: string, customFieldId: string, value: string) {
+  const session = await auth();
+  if (!session?.user?.id) return;
+  await assertCanEditTask(session.user.id, taskId);
+
+  if (!value.trim()) {
+    await prisma.customFieldValue.deleteMany({ where: { taskId, customFieldId } });
+  } else {
+    await prisma.customFieldValue.upsert({
+      where: { taskId_customFieldId: { taskId, customFieldId } },
+      update: { value },
+      create: { taskId, customFieldId, value },
+    });
+  }
   revalidatePath("/");
 }
 
@@ -500,6 +586,79 @@ export async function updateTaskDescription(taskId: string, description: string)
   revalidatePath("/");
 }
 
+export async function updateTaskTitle(taskId: string, title: string) {
+  const session = await auth();
+  if (!session?.user?.id) return;
+  const trimmed = title.trim();
+  if (!trimmed) return;
+  await assertCanEditTask(session.user.id, taskId);
+  await prisma.task.update({ where: { id: taskId }, data: { title: trimmed } });
+  revalidatePath("/");
+}
+
+export async function moveTaskToList(taskId: string, listId: string) {
+  const session = await auth();
+  if (!session?.user?.id) return;
+  const task = await prisma.task.findUnique({ where: { id: taskId }, select: { listId: true } });
+  if (!task) throw new Error("Task not found");
+  await assertCanEditTask(session.user.id, taskId);
+  if (task.listId === listId) return;
+
+  const [currentList, targetList] = await Promise.all([
+    prisma.list.findUnique({ where: { id: task.listId }, select: { spaceId: true } }),
+    prisma.list.findUnique({ where: { id: listId }, select: { spaceId: true } }),
+  ]);
+  if (!targetList || !currentList || targetList.spaceId !== currentList.spaceId) {
+    throw new Error("Can't move a task to a different space");
+  }
+
+  await prisma.task.update({ where: { id: taskId }, data: { listId } });
+  revalidatePath("/");
+}
+
+export async function updateProfileName(name: string) {
+  const session = await auth();
+  if (!session?.user?.id) return;
+  const trimmed = name.trim();
+  if (!trimmed) return;
+  await prisma.user.update({ where: { id: session.user.id }, data: { name: trimmed } });
+  revalidatePath("/");
+}
+
+export async function updatePassword(currentPassword: string, newPassword: string) {
+  const session = await auth();
+  if (!session?.user?.id) return;
+  if (newPassword.length < 8) throw new Error("New password must be at least 8 characters");
+
+  const user = await prisma.user.findUnique({ where: { id: session.user.id }, select: { passwordHash: true } });
+  if (!user?.passwordHash || !(await bcrypt.compare(currentPassword, user.passwordHash))) {
+    throw new Error("Current password is incorrect");
+  }
+
+  const passwordHash = await bcrypt.hash(newPassword, 10);
+  await prisma.user.update({ where: { id: session.user.id }, data: { passwordHash } });
+}
+
+export async function updateNotificationPrefs(prefs: Record<string, boolean>) {
+  const session = await auth();
+  if (!session?.user?.id) return;
+  await prisma.user.update({ where: { id: session.user.id }, data: { notificationPrefs: prefs } });
+  revalidatePath("/");
+}
+
+export async function markChannelRead(channelId: string) {
+  const session = await auth();
+  if (!session?.user?.id) return;
+  const channel = await prisma.channel.findUnique({ where: { id: channelId }, select: { members: { select: { id: true } } } });
+  if (!channel || !channel.members.some((m) => m.id === session.user.id)) return;
+  await prisma.channelRead.upsert({
+    where: { userId_channelId: { userId: session.user.id, channelId } },
+    create: { userId: session.user.id, channelId },
+    update: { lastReadAt: new Date() },
+  });
+  revalidatePath("/");
+}
+
 export async function postMessage(channelId: string, body: string, parentMessageId?: string) {
   const session = await auth();
   if (!session?.user?.id) return;
@@ -523,7 +682,7 @@ export async function postMessage(channelId: string, body: string, parentMessage
   const memberIds = new Set(channel.members.map((m) => m.id));
   const mentioned = mentionedUserIds(trimmed).filter((id) => memberIds.has(id));
   for (const userId of mentioned) {
-    await notify(userId, session.user.id, `${actor} mentioned you in #${channel.name ?? "chat"}`);
+    await notify(userId, session.user.id, `${actor} mentioned you in #${channel.name ?? "chat"}`, undefined, "chatMentions");
   }
 
   revalidatePath("/");
@@ -553,7 +712,7 @@ export async function postComment(taskId: string, body: string) {
   const actor = session.user.name ?? session.user.email ?? "Someone";
   const recipients = new Set([task.createdById, ...task.assignees.map((a) => a.id)]);
   for (const userId of recipients) {
-    await notify(userId, session.user.id, `${actor} commented on '${task.title}'`, taskId);
+    await notify(userId, session.user.id, `${actor} commented on '${task.title}'`, taskId, "comments");
   }
 
   // ponytail: mentions are validated against workspace membership, not this
@@ -562,7 +721,7 @@ export async function postComment(taskId: string, body: string) {
   const mentioned = await filterWorkspaceMembers(task.list.space.workspaceId, mentionedUserIds(trimmed));
   for (const userId of mentioned) {
     if (recipients.has(userId)) continue;
-    await notify(userId, session.user.id, `${actor} mentioned you in a comment on '${task.title}'`, taskId);
+    await notify(userId, session.user.id, `${actor} mentioned you in a comment on '${task.title}'`, taskId, "comments");
   }
 
   revalidatePath("/");

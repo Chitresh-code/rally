@@ -30,12 +30,6 @@ body {
 .rl-guest-toggle {
   display: flex;
 }
-.rl-hide-mobile {
-  display: flex;
-}
-.rl-mobile-only {
-  display: none;
-}
 @media (max-width: 899px) {
   .rl-sidebar {
     display: none;
@@ -52,12 +46,18 @@ body {
   .rl-taskpanel {
     width: 100% !important;
   }
-  .rl-hide-mobile {
-    display: none !important;
+  .rl-sprint-grid {
+    grid-template-columns: 1fr !important;
   }
-  .rl-mobile-only {
-    display: flex !important;
-  }
+}
+
+/* Board task cards: subtle lift on hover/focus. */
+.rl-taskcard {
+  transition: box-shadow 0.12s ease, transform 0.12s ease;
+}
+.rl-taskcard:hover {
+  box-shadow: 0 4px 14px oklch(0 0 0 / 0.08);
+  transform: translateY(-1px);
 }
 
 /* Skeleton loading blocks. */

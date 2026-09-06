@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
 import { prisma } from "@/lib/prisma";
-import { assertListAccess } from "@/app/actions";
+import { requireListAccess } from "@/lib/access";
 import { readAttachmentFile } from "@/lib/storage";
 
 export async function GET(_req: Request, { params }: { params: Promise<{ id: string }> }) {
@@ -16,7 +16,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   if (!attachment) return new NextResponse("Not found", { status: 404 });
 
   try {
-    await assertListAccess(session.user.id, attachment.task.listId);
+    await requireListAccess(session.user.id, attachment.task.listId);
   } catch {
     return new NextResponse("Forbidden", { status: 403 });
   }
